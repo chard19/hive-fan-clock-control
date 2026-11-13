@@ -1,0 +1,195 @@
+#!/usr/bin/python3
+"""Configure the selected Cryptone case-fan controller, without restarting it."""
+import argparse
+import fcntl
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+CONTROL_PATH = Path('/usr/local/sbin/cryptone-fan-control.py')
+CONFIG_PATH = Path('/etc/cryptone-fan-control.json')
+STATUS_PATH = Path('/run/cryptone-fan-control/status.json')
+SERVICE = 'cryptone-fan-control.service'
+ACK_TIMEOUT = 15
+FIELDS = ('target_c', 'min_pwm_percent', 'max_pwm_percent')
+
+
+def load_control():
+    spec = importlib.util.spec_from_file_location('cryptone_control', CONTROL_PATH)
+    control = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control)
+    return control
+
+
+def service_status():
+    result = subprocess.run(['systemctl', 'is-active', SERVICE],
+                            capture_output=True, text=True, timeout=3, check=False)
+    return result.stdout.strip() or 'unknown'
+
+
+def service_pid():
+    result = subprocess.run(['systemctl', 'show', SERVICE, '--property=MainPID', '--value'],
+                            capture_output=True, text=True, timeout=3, check=False)
+    return int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+
+
+def read_status():
+    try:
+        status = json.loads(STATUS_PATH.read_text())
+        return status if isinstance(status, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def fresh(status):
+    stamp = status.get('updated_at')
+    return isinstance(stamp, (int, float)) and 0 <= time.time() - stamp <= 15
+
+
+def describe(cfg):
+    return (f"цель {cfg['target_c']} °C; PWM "
+            f"{cfg['min_pwm_percent']}–{cfg['max_pwm_percent']}%")
+
+
+def show(control):
+    cfg = control.load_config(CONFIG_PATH)
+    status = read_status()
+    state = service_status()
+    print(f'Сохранено: {describe(cfg)}')
+    print(f'Служба: {state}')
+    applied = status.get('applied_config')
+    if isinstance(applied, dict) and all(key in applied for key in FIELDS):
+        current = (fresh(status) and state == 'active' and
+                   status.get('controller_pid', 0) == service_pid() > 0)
+        print(f"{'Применено' if current else 'Последнее применённое'}: {describe(applied)}")
+        if current:
+            print(f"PWM сейчас: {status.get('pwm_actual_percent')}%; "
+                  f"горячая GPU: {status.get('hottest_c')} °C; режим: {status.get('mode')}")
+    if (state != 'active' or not fresh(status) or status.get('config_error') or
+            status.get('controller_pid', 0) != service_pid() or
+            status.get('config_hash') != control.config_hash(cfg)):
+        print('Применение сохранённых настроек пока не подтверждено.')
+    if status.get('error'):
+        print(f"Последняя ошибка: {status['error']}")
+    return 0
+
+
+def prompt_values(cfg):
+    labels = ('Целевая температура, °C', 'Минимальный PWM, %', 'Максимальный PWM, %')
+    values = []
+    for key, label in zip(FIELDS, labels):
+        raw = input(f'{label} [{cfg[key]}]: ').strip()
+        values.append(cfg[key] if not raw else integer(raw))
+    return values
+
+
+def integer(raw):
+    if not raw.isascii() or not raw.isdecimal():
+        raise ValueError('Введите целое положительное число без единиц измерения.')
+    return int(raw)
+
+
+def candidate_config(control, cfg, values):
+    target, minimum, maximum = values
+    if not 20 <= target <= 70:
+        raise ValueError('Целевая температура должна быть от 20 до 70 °C.')
+    if not 30 <= minimum < maximum <= 100:
+        raise ValueError('PWM: 30 ≤ минимум < максимум ≤ 100%.')
+    candidate = dict(cfg, **dict(zip(FIELDS, values)))
+    candidate['recovery_c'] = max(70, candidate['target_c'] + 2)
+    return control.validate_config(candidate)
+
+
+def atomic_write(path, cfg):
+    descriptor, name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o644)
+            json.dump(cfg, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def wait_applied(control, cfg):
+    digest = control.config_hash(cfg)
+    deadline = time.monotonic() + ACK_TIMEOUT
+    while time.monotonic() < deadline:
+        status = read_status()
+        if (fresh(status) and status.get('config_hash') == digest and
+                not status.get('config_error') and service_status() == 'active' and
+                status.get('controller_pid', 0) == service_pid() > 0):
+            return status
+        time.sleep(0.25)
+    return None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='fanset: цель °C, минимальный PWM %, максимальный PWM %',
+        epilog='Пример: fanset 65 30 100. Без аргументов — пошаговый ввод.')
+    parser.add_argument('values', nargs='*', metavar='ЧИСЛО')
+    parser.add_argument('--show', action='store_true', help='Показать настройки и состояние службы')
+    args = parser.parse_args(argv)
+    if args.show and args.values:
+        parser.error('--show нельзя сочетать с настройкой значений')
+    if len(args.values) not in (0, 3):
+        parser.error('Нужны три числа: fanset 65 30 100')
+    try:
+        control = load_control()
+        if args.show:
+            return show(control)
+        if os.geteuid() != 0:
+            raise ValueError('Для изменения настроек запустите fanset через sudo или HiveShell.')
+        cfg = control.load_config(CONFIG_PATH)
+        values = ([integer(value) for value in args.values] if args.values else prompt_values(cfg))
+        candidate = candidate_config(control, cfg, values)
+        if not args.values:
+            print(f'Новые настройки: {describe(candidate)}')
+            if input('Применить? [д/Н]: ').strip().lower() not in ('д', 'да', 'y', 'yes'):
+                print('Отменено. Настройки не изменены.')
+                return 0
+        lock_path = CONFIG_PATH.with_name('.cryptone-fan-control.lock')
+        with lock_path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('Другая команда fanset уже работает. Повторите после её завершения.') from None
+            latest = control.load_config(CONFIG_PATH)
+            if latest != cfg:
+                raise ValueError('Настройки изменились во время ввода. Повторите fanset.')
+            atomic_write(CONFIG_PATH, candidate)
+            print(f'Сохранено: {describe(candidate)}', flush=True)
+            status = wait_applied(control, candidate)
+            if status is None:
+                print('Настройки сохранены, но применение не подтверждено. Проверьте fanset --show.',
+                      file=sys.stderr)
+                return 2
+            print(f"Применено. PWM сейчас: {status['pwm_actual_percent']}%; режим: {status['mode']}.")
+            if status.get('mode') == 'emergency':
+                print('Действует аварийное охлаждение 100% независимо от обычного максимума.')
+            return 0
+    except (KeyboardInterrupt, EOFError):
+        print('\nfanset прерван. Если уже выведено «Сохранено», проверьте fanset --show.', file=sys.stderr)
+        return 130
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f'fanset: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

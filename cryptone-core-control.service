@@ -1,0 +1,33 @@
+[Unit]
+Description=Cryptone per-GPU thermal core-clock guard
+After=cryptone-fan-control.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+Environment=PATH=/hive/sbin:/hive/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=/hive/lib
+ExecStart=/usr/bin/python3 /usr/local/sbin/cryptone-core-control.py
+Restart=on-failure
+RestartSec=5
+WatchdogSec=60
+WatchdogSignal=SIGKILL
+TimeoutStartSec=20
+TimeoutStopSec=20
+StateDirectory=cryptone-core-control
+StateDirectoryMode=0755
+RuntimeDirectory=cryptone-core-control
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

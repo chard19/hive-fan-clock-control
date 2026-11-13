@@ -1,0 +1,299 @@
+#!/usr/bin/python3
+"""Read-only combined status of Cryptone case fans and per-GPU core control."""
+import argparse
+import json
+import math
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import sys
+import time
+import tomllib
+
+CONTROL_PATH = Path('/usr/local/sbin/cryptone-fan-control.py')
+CONFIG_PATH = Path('/etc/cryptone-fan-control.json')
+CASE_STATUS = Path('/run/cryptone-fan-control/status.json')
+CORE_STATUS = Path('/run/cryptone-core-control/status.json')
+CORE_CONFIG = Path('/etc/cryptone-core-control.toml')
+UUID_RE = re.compile(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z')
+FIELDS = ('min_pwm_percent', 'target_c', 'max_pwm_percent')
+MODES = {
+    'normal': 'норма', 'holding': 'удержание', 'waiting_hot': 'ожидание снижения',
+    'waiting_cool': 'ожидание повышения', 'waiting_fans': 'есть запас обдува',
+    'reduced': 'снижение', 'recovering': 'восстановление', 'minimum': 'минимум',
+    'emergency': 'аварийный минимум', 'emergency_cooling': 'выход из аварии',
+    'sensor_error': 'ошибка датчиков', 'paused_hive': 'пауза управления',
+    'apply_error': 'ошибка применения', 'storage_error': 'ошибка сохранения',
+    'stopped': 'остановлен',
+}
+
+
+def number(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def value(item):
+    return f'{item:g}' if number(item) else '—'
+
+
+def read_object(path):
+    with Path(path).open('rb') as stream:
+        raw = stream.read(1048577)
+    if len(raw) > 1048576:
+        raise ValueError('файл слишком большой')
+    def reject_constant(constant):
+        raise ValueError(f'нечисловое значение {constant}')
+    data = json.loads(raw, parse_constant=reject_constant)
+    if not isinstance(data, dict):
+        raise ValueError('ожидался JSON-объект')
+    return data
+
+
+def service_status(name):
+    try:
+        result = subprocess.run(
+            ['systemctl', 'show', name, '--property=ActiveState', '--property=MainPID'],
+            capture_output=True, text=True, timeout=3, check=False)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or 'systemctl завершился с ошибкой')
+        fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+        return {'state': fields.get('ActiveState', 'unknown'),
+                'pid': int(fields.get('MainPID', '0'))}
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        return {'state': 'unknown', 'pid': 0, 'error': str(exc)}
+
+
+def runtime_status(path, service):
+    errors = []
+    try:
+        data = read_object(path)
+    except (OSError, ValueError) as exc:
+        data = {}
+        errors.append(f'Статус недоступен: {exc}')
+    active = service_status(service)
+    stamp = data.get('updated_at')
+    age = time.time() - stamp if number(stamp) else None
+    current = (active['state'] == 'active' and active['pid'] > 0 and
+               active['pid'] == data.get('controller_pid') and
+               age is not None and 0 <= age <= 20)
+    if not current:
+        errors.append('Показания устарели, служба не работает или PID не совпадает')
+    if active.get('error'):
+        errors.append(active['error'])
+    if data.get('config_error'):
+        errors.append(f"Конфигурация отклонена: {data['config_error']}")
+    if data.get('error'):
+        errors.append(str(data['error']))
+    if isinstance(data.get('errors'), list):
+        errors.extend(str(e) for e in data['errors'])
+    return {'service': active, 'age_seconds': age, 'current': current,
+            'status': data, 'warnings': errors}
+
+
+def fan_settings(cfg):
+    if not isinstance(cfg, dict) or any(not number(cfg.get(k)) for k in FIELDS):
+        return None
+    return {key: cfg[key] for key in FIELDS}
+
+
+def read_pwm(control, cfg):
+    state = control['Fan'](cfg).state()
+    raw, mode = state['pwm_raw'], state['pwm_mode']
+    if type(raw) is not int or not 0 <= raw <= 255 or type(mode) is not int or mode < 0:
+        raise ValueError('неверные показания PWM')
+    # In BIOS mode the stored duty is not a confirmed current percentage.
+    percent = 100.0 if mode == 0 else round(raw * 100 / 255, 1) if mode == 1 else None
+    return dict(state, percent=percent)
+
+
+def validate_gpus(core, expected):
+    rows = core['status'].get('gpu')
+    if not isinstance(rows, dict):
+        rows = {}
+        core['warnings'].append('Показания видеокарт недоступны или повреждены')
+    if expected is not None and set(rows) != set(expected):
+        core['warnings'].append('Состав GPU в статусе не совпадает с конфигурацией')
+    if not rows:
+        core['warnings'].append('Показания видеокарт недоступны или повреждены')
+    cleaned = {}
+    ranges = {'temperature_c': (0, 120), 'fan_percent': (0, 100),
+              'actual_core_mhz': (0, 10000), 'baseline_mhz': (500, 10000),
+              'locked_mhz': (500, 10000), 'wait_seconds': (0, 3600)}
+    for uuid in dict.fromkeys([*(expected or []), *rows]):
+        if not isinstance(uuid, str) or not UUID_RE.fullmatch(uuid):
+            core['warnings'].append('Некорректный UUID в статусе GPU')
+            continue
+        gpu = rows.get(uuid)
+        if not isinstance(gpu, dict):
+            gpu = {}
+        else:
+            gpu = dict(gpu)
+        problems = []
+        if type(gpu.get('index')) is not int or gpu['index'] < 0:
+            gpu['index'] = None
+            problems.append('индекс недоступен')
+        mode = gpu.get('mode')
+        if not isinstance(mode, str) or mode not in MODES:
+            mode = gpu['mode'] = 'sensor_error'
+            problems.append('неверный режим')
+        for field, (low, high) in ranges.items():
+            item = gpu.get(field)
+            optional = field == 'wait_seconds' or (field == 'baseline_mhz' and mode == 'paused_hive')
+            if not (number(item) and low <= item <= high):
+                gpu[field] = None
+                if item is not None or not optional:
+                    problems.append(f'{field} недоступно')
+        if mode in {'sensor_error', 'apply_error', 'storage_error', 'paused_hive', 'stopped',
+                    'emergency', 'emergency_cooling'}:
+            problems.insert(0, MODES[mode])
+        if gpu.get('error'):
+            problems.insert(0, str(gpu['error']))
+        if problems:
+            core['warnings'].append(f"GPU {gpu['index'] if gpu['index'] is not None else uuid[-8:]}: "
+                                    + '; '.join(dict.fromkeys(problems)))
+        cleaned[uuid] = gpu
+    core['status']['gpu'] = cleaned
+
+
+def collect():
+    case = runtime_status(CASE_STATUS, 'cryptone-fan-control.service')
+    core = runtime_status(CORE_STATUS, 'cryptone-core-control.service')
+    case.update(saved_settings=None, applied_settings=fan_settings(
+        case['status'].get('applied_config')), settings_confirmed=False, pwm=None)
+    cfg = None
+    try:
+        control = runpy.run_path(str(CONTROL_PATH))
+    except (OSError, ValueError, ImportError, SyntaxError) as exc:
+        case['warnings'].append(f'Модуль корпусного регулятора недоступен: {exc}')
+    else:
+        try:
+            cfg = control['load_config'](CONFIG_PATH)
+            case['saved_settings'] = fan_settings(cfg)
+            case['settings_confirmed'] = bool(
+                case['current'] and not case['status'].get('config_error') and
+                case['saved_settings'] is not None and
+                case['saved_settings'] == case['applied_settings'] and
+                case['status'].get('config_hash') == control['config_hash'](cfg))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            case['warnings'].append(f'Настройки fanset недоступны: {exc}')
+        try:
+            # Read the channel actually accepted by the running daemon.
+            applied = case['status'].get('applied_config')
+            pwm_cfg = control['validate_config'](applied) if case['current'] else cfg
+            if pwm_cfg is None:
+                raise ValueError('конфигурация PWM недоступна')
+            case['pwm'] = read_pwm(control, pwm_cfg)
+            if case['pwm']['percent'] is None:
+                case['warnings'].append('PWM управляется BIOS; текущий PWM не подтверждён')
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+            case['warnings'].append(f'Не удалось прочитать фактический PWM: {exc}')
+    if not case['settings_confirmed']:
+        case['warnings'].append('Применение сохранённых настроек fanset не подтверждено')
+    if case['current']:
+        status = case['status']
+        if status.get('mode') not in ('normal', 'emergency'):
+            case['warnings'].append('Режим корпусного регулятора недоступен или повреждён')
+        if status.get('mode') == 'emergency':
+            case['warnings'].insert(0, 'Аварийное охлаждение 100% независимо от обычного максимума')
+        elif status.get('target_unmet_at_limit'):
+            case['warnings'].insert(0, 'Максимум PWM достигнут, целевая температура не удерживается')
+        if not number(status.get('hottest_c')) or not 0 <= status['hottest_c'] <= 120:
+            status['hottest_c'] = None
+            case['warnings'].append('Температура самой горячей GPU недоступна')
+        applied = case['applied_settings']
+        pwm = case['pwm']
+        if (status.get('mode') == 'normal' and applied and pwm and number(pwm['percent']) and
+                not applied['min_pwm_percent'] - 0.4 <= pwm['percent'] <= applied['max_pwm_percent'] + 0.4):
+            case['warnings'].append('Фактический PWM вне применённых границ')
+    expected = None
+    try:
+        with CORE_CONFIG.open('rb') as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise ValueError('файл слишком большой')
+        expected = tomllib.loads(raw.decode())['rig']['gpu_uuids']
+        if (not isinstance(expected, list) or not expected or
+                any(not isinstance(u, str) or not UUID_RE.fullmatch(u) for u in expected) or
+                len(set(expected)) != len(expected)):
+            raise ValueError('неверный список UUID')
+        if cfg and set(expected) != set(cfg['expected_gpu_uuids']):
+            core['warnings'].append('Списки GPU корпусного и частотного регуляторов различаются')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        expected = None
+        core['warnings'].append(f'Конфигурация GPU недоступна: {exc}')
+    validate_gpus(core, expected)
+    cooling = core['status'].get('cooling')
+    if (not isinstance(cooling, dict) or not number(cooling.get('gpu_max')) or
+            not 1 <= cooling['gpu_max'] <= 100):
+        core['warnings'].append('Максимум вентиляторов GPU недоступен')
+        core['status']['cooling'] = None
+    for section in (case, core):
+        section['warnings'] = list(dict.fromkeys(section['warnings']))
+    return {'case': case, 'core': core}
+
+
+def settings_text(cfg):
+    cfg = cfg or {}
+    return (f"{value(cfg.get('min_pwm_percent'))}%; "
+            f"{value(cfg.get('target_c'))} °C; {value(cfg.get('max_pwm_percent'))}%")
+
+
+def print_help():
+    print('\nНастройка:')
+    print('  Пример: fanset 65 30 100; fanset — пошагово; fanset --show — настройки.')
+    print('  Предел частоты каждой GPU задаётся в HiveOS.')
+    print('  Пороги, шаг и задержки ядра: nano /etc/cryptone-core-control.toml')
+    print('  Настройки перечитываются за 5 с.')
+
+
+def render(report):
+    case, core = report['case'], report['core']
+    print(f"Заданные параметры FAN : {settings_text(case['saved_settings'])}")
+    pwm = case['pwm']
+    percent = pwm['percent'] if pwm else None
+    percent_text = f'{percent:.0f}' if number(percent) else '—'
+    status = case['status']
+    hottest = status.get('hottest_c') if case['current'] else None
+    print(f'Текущие значение FAN: {percent_text}%, {value(hottest)}°C\n')
+    rows = core['status'].get('gpu', {})
+    for uuid, gpu in sorted(rows.items(), key=lambda item: (
+            item[1].get('index') if type(item[1].get('index')) is int else 999, item[0])):
+        shown = gpu if core['current'] else {}
+        print(f"GPU {gpu.get('index', '?')} [{uuid[-8:]}]: "
+              f"{value(shown.get('temperature_c'))} °C; вентилятор {value(shown.get('fan_percent'))}%")
+        print(f"  HiveOS {value(shown.get('baseline_mhz'))}; фиксация {value(shown.get('locked_mhz'))}; "
+              f"рабочая {value(shown.get('actual_core_mhz'))} МГц")
+        mode = shown.get('mode', 'показания недоступны')
+        if not isinstance(mode, str):
+            mode = 'показания недоступны'
+        wait = shown.get('wait_seconds')
+        suffix = f'; осталось {value(wait)} с' if number(wait) else ''
+        print(f"  {MODES.get(mode, mode)}{suffix}")
+        if shown.get('pause_reason'):
+            print('  Причина:', shown['pause_reason'])
+    cooling = core['status'].get('cooling')
+    maximum = cooling.get('gpu_max') if isinstance(cooling, dict) and core['current'] else None
+    print(f"  Максимум вентиляторов GPU: {value(maximum)}%")
+    for label, section in (('Корпус', case), ('Ядро', core)):
+        messages = list(dict.fromkeys(section['warnings']))
+        if messages:
+            details = '; подробности: fancheck --json' if len(messages) > 1 else ''
+            print(f'ВНИМАНИЕ [{label}]: {messages[0]}{details}')
+    print_help()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Общий статус корпусных вентиляторов и частот GPU')
+    parser.add_argument('--json', action='store_true', help='Общий статус в формате JSON')
+    args = parser.parse_args(argv)
+    report = collect()
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        render(report)
+    return int(any(section['warnings'] for section in report.values()))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

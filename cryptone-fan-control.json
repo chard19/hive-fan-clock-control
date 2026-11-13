@@ -1,0 +1,23 @@
+{
+  "min_pwm_percent": 30,
+  "max_pwm_percent": 100,
+  "startup_pwm_percent": 55,
+  "target_c": 65,
+  "critical_c": 75,
+  "recovery_c": 70,
+  "deadband_c": 1,
+  "poll_seconds": 5,
+  "rise_interval_seconds": 10,
+  "fall_interval_seconds": 20,
+  "expected_gpu_uuids": [
+    "GPU-00000000-0000-0000-0000-000000000001",
+    "GPU-00000000-0000-0000-0000-000000000002",
+    "GPU-00000000-0000-0000-0000-000000000003",
+    "GPU-00000000-0000-0000-0000-000000000004"
+  ],
+  "controller": {
+    "hwmon_name": "example_chip",
+    "device_path": "/sys/devices/platform/example.0",
+    "pwm_channel": 1
+  }
+}

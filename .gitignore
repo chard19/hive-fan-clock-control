@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.ruff_cache/
+build/
+build-*/
+dist/
+*.log
+*.png
+*.jpg
+*.zip
+backup*/
+baseline.json
+status.json
+state.json
+SHA256SUMS
