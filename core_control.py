@@ -34,6 +34,10 @@ HIVE_BUS = Path('/hive-config/busid.conf')
 HIVE_FANS = Path('/hive-config/autofan.conf')
 CASE_STATUS = Path('/run/cryptone-fan-control/status.json')
 POLL = 5
+RESERVE_TEMP_C = 70
+RESERVE_HOLD_SECONDS = 60
+RESERVE_STEP_MHZ = 50
+FAN_TOLERANCE_PERCENT = 2
 CLOCK_TOLERANCE = 15  # NVIDIA chooses the nearest supported clock.
 UUID_RE = re.compile(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z')
 LOG = logging.getLogger('cryptone-core')
@@ -279,8 +283,7 @@ def hive_baselines(gpus, oc_path=HIVE_OC, detect_path=HIVE_DETECT, bus_path=HIVE
     return result
 
 
-def cooling_limits(case_path=CASE_STATUS, fan_path=HIVE_FANS, wall_time=None):
-    now = time.time() if wall_time is None else wall_time
+def case_cooling(case_path, now):
     case = json.loads(bounded_read(case_path))
     age = now - case['updated_at']
     if not 0 <= age <= 20:
@@ -293,12 +296,32 @@ def cooling_limits(case_path=CASE_STATUS, fan_path=HIVE_FANS, wall_time=None):
     case_error = case.get('error') or case.get('config_error')
     if case_error and not (case.get('mode') == 'emergency' and pwm >= 98):
         raise ValueError('Case-fan error without confirmed emergency PWM')
-    fans = shell_values(bounded_read(fan_path).decode(), {'ENABLED', 'MAX_FAN'})
+    return dict(case_pwm=pwm, case_max=maximum,
+                case_at_max=pwm >= maximum - FAN_TOLERANCE_PERCENT, case_error=case_error)
+
+
+def gpu_fan_max(fan_path):
+    fans = shell_values(bounded_read(fan_path).decode(), {'ENABLED', 'MAX_FAN', 'CUSTOM_MODE'})
+    if fans.get('CUSTOM_MODE', '') not in ('', '0'):
+        raise ValueError('Hive AutoFan custom limits cannot be mapped reliably to GPUs')
     gpu_max = int(fans.get('MAX_FAN', '0'))
     if fans.get('ENABLED') != '1' or not 1 <= gpu_max <= 100:
         raise ValueError('Hive AutoFan must have a valid enabled maximum')
-    return dict(case_pwm=pwm, case_max=maximum, gpu_max=gpu_max,
-                case_at_max=pwm >= maximum - 2, case_error=case_error)
+    return gpu_max
+
+
+def cooling_limits(case_path=CASE_STATUS, fan_path=HIVE_FANS, wall_time=None):
+    now = time.time() if wall_time is None else wall_time
+    try:
+        limits = case_cooling(case_path, now)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        limits = dict(case_pwm=None, case_max=None, case_at_max=False, case_error=str(exc)[:180])
+    try:
+        gpu_max = gpu_fan_max(fan_path)
+    except (OSError, ValueError) as exc:
+        return dict(limits, gpu_max=None, gpu_fan_threshold_percent=None, gpu_error=str(exc)[:180])
+    return dict(limits, gpu_max=gpu_max, gpu_fan_threshold_percent=gpu_max - FAN_TOLERANCE_PERCENT,
+                gpu_error=None)
 
 
 @dataclass
@@ -307,23 +330,36 @@ class GPUState:
     baseline: int | None = None
     emergency: bool = False
     hot_since: float | None = None
+    reserve_since: float | None = None
     cool_since: float | None = None
     signature: tuple | None = None
+    case_max: float | None = None
+    gpu_max: int | None = None
+    reduction_rule: str | None = None
+    pending_reduction: int | None = None
 
     def persistent(self):
         return dict(current=self.current, baseline=self.baseline, emergency=self.emergency)
 
     def reset_timers(self):
-        self.hot_since = self.cool_since = None
+        self.hot_since = self.reserve_since = self.cool_since = None
+        self.reduction_rule = None
 
 
 def decide(state, settings, baseline, locked, temperature, cooling_at_max, now,
-           allow_growth=True):
+           allow_growth=True, *, case_at_max=False, case_max=None, gpu_max=None):
     """Return (desired lock or None, mode, wait seconds). No hardware I/O."""
+    state.reduction_rule = None
     signature = (baseline, settings)
     if state.signature != signature:
         state.reset_timers()
         state.signature = signature
+    if state.case_max != case_max:
+        state.hot_since = state.reserve_since = None
+        state.case_max = case_max
+    if state.gpu_max != gpu_max:
+        state.hot_since = None
+        state.gpu_max = gpu_max
     state.baseline = baseline
     if baseline is None or baseline < settings.min_core_mhz:
         state.reset_timers()
@@ -348,7 +384,7 @@ def decide(state, settings, baseline, locked, temperature, cooling_at_max, now,
         state.current = min(state.current, settings.min_core_mhz)
         return state.current, 'emergency', None
     if state.emergency:
-        state.hot_since = None
+        state.hot_since = state.reserve_since = None
         if temperature <= settings.cool_c and allow_growth:
             if state.cool_since is None:
                 state.cool_since = now
@@ -361,23 +397,44 @@ def decide(state, settings, baseline, locked, temperature, cooling_at_max, now,
             return state.current, 'emergency_cooling', math.ceil(wait)
         state.cool_since = None
         return state.current, 'emergency', None
-    mode, wait = 'normal', None
-    if temperature >= settings.hot_c and cooling_at_max:
+    regular_hot = temperature >= settings.hot_c and cooling_at_max
+    reserve_hot = temperature >= RESERVE_TEMP_C and case_at_max
+    if regular_hot or reserve_hot:
         state.cool_since = None
         if state.current <= settings.min_core_mhz:
-            state.hot_since = None
-            mode = 'minimum'
-        else:
+            state.hot_since = state.reserve_since = None
+            return state.current, 'minimum', None
+        if regular_hot:
             if state.hot_since is None:
                 state.hot_since = now
-            wait = max(0, settings.hot_hold_seconds - (now - state.hot_since))
-            mode = 'waiting_hot'
-            if wait == 0:
-                state.current = max(settings.min_core_mhz, state.current - settings.step_mhz)
-                state.hot_since = now
-                mode, wait = 'reduced', settings.hot_hold_seconds
-    elif temperature <= settings.cool_c and state.current < ceiling and allow_growth:
-        state.hot_since = None
+        else:
+            state.hot_since = None
+        if reserve_hot:
+            if state.reserve_since is None:
+                state.reserve_since = now
+        else:
+            state.reserve_since = None
+        regular_wait = (state.hot_since + settings.hot_hold_seconds - now
+                        if regular_hot else math.inf)
+        reserve_wait = (state.reserve_since + RESERVE_HOLD_SECONDS - now
+                        if reserve_hot else math.inf)
+        # If both matured in this poll, only the reserve step is applied.
+        use_reserve = reserve_wait <= 0 or (regular_wait > 0 and reserve_wait <= regular_wait)
+        state.reduction_rule = 'reserve' if use_reserve else 'regular'
+        wait = reserve_wait if use_reserve else regular_wait
+        if wait > 0:
+            return state.current, 'waiting_hot', math.ceil(wait)
+        step = RESERVE_STEP_MHZ if use_reserve else settings.step_mhz
+        state.current = max(settings.min_core_mhz, state.current - step)
+        state.hot_since = now if regular_hot else None
+        state.reserve_since = now if reserve_hot else None
+        next_wait = min(settings.hot_hold_seconds if regular_hot else math.inf,
+                        RESERVE_HOLD_SECONDS if reserve_hot else math.inf)
+        return state.current, 'reduced', next_wait
+
+    mode, wait = 'normal', None
+    if temperature <= settings.cool_c and state.current < ceiling and allow_growth:
+        state.hot_since = state.reserve_since = None
         if state.cool_since is None:
             state.cool_since = now
         wait = max(0, settings.cool_hold_seconds - (now - state.cool_since))
@@ -475,6 +532,14 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                 limits = cooling_limits()
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 errors.append(f'Cooling: {str(exc)[:180]}')
+            case_at_max = bool(limits and limits['case_at_max'])
+            case_max = limits.get('case_max') if limits else None
+            gpu_max = limits.get('gpu_max') if limits else None
+            gpu_threshold = limits.get('gpu_fan_threshold_percent') if limits else None
+            if limits and case_max is None and limits.get('case_error'):
+                errors.append(f"Case cooling: {limits['case_error']}")
+            if limits and limits.get('gpu_error'):
+                errors.append(f"Hive AutoFan: {limits['gpu_error']}")
             rows = {}
             for uuid in cfg.uuids:
                 notify('WATCHDOG=1')
@@ -484,18 +549,27 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                 temp = gpu.get('temperature_c')
                 observed = locks.get(uuid)
                 fan = gpu.get('fan_percent')
-                cooling_max = bool(limits and limits['case_at_max'] and fan is not None and
-                                   fan >= limits['gpu_max'] - 2)
+                cooling_max = (case_at_max and gpu_threshold is not None and fan is not None and
+                               fan >= gpu_threshold)
                 # Invalid cooling data blocks recovery, but never the 75 C emergency.
                 baseline = baselines.get(uuid, state.baseline)
                 if uuid not in baselines and baseline is None and temp is not None and \
                         temp >= settings.emergency_c:
                     # A failed HiveOC read must not prevent a downward emergency action.
                     baseline = observed
+                previous_target = state.current
                 desired, mode, wait = decide(state, settings, baseline, observed,
                                              temp, cooling_max, started,
                                              allow_growth=not errors and not config_error
-                                             and fan is not None and not persistence_error)
+                                             and fan is not None and not persistence_error,
+                                             case_at_max=case_at_max, case_max=case_max, gpu_max=gpu_max)
+                if (desired is not None and observed is not None and desired < observed and
+                        mode in ('reduced', 'emergency') and desired != previous_target):
+                    # Even a last step smaller than the readback tolerance needs a write.
+                    state.pending_reduction = desired
+                elif state.pending_reduction != desired or (
+                        desired is not None and observed is not None and observed <= desired):
+                    state.pending_reduction = None
                 error = None
                 changed = persistent_data(states)
                 if changed != saved or persistence_error:
@@ -508,11 +582,13 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                         persistence_error = f'State persistence failed: {str(exc)[:160]}'
                 try:
                     if (not stop.is_set() and desired is not None and observed is not None
-                            and abs(desired - observed) > CLOCK_TOLERANCE
+                            and (abs(desired - observed) > CLOCK_TOLERANCE or
+                                 state.pending_reduction == desired)
                             and (not persistence_error or desired < observed)):
                         observed = apply_clock(uuid, desired)
-                        LOG.info('%s lock=%sMHz readback=%sMHz mode=%s', uuid, desired,
-                                 observed, mode)
+                        state.pending_reduction = None
+                        LOG.info('%s lock=%sMHz readback=%sMHz mode=%s rule=%s', uuid, desired,
+                                 observed, mode, state.reduction_rule)
                 except (OSError, ValueError, subprocess.SubprocessError, RuntimeError) as exc:
                     error = str(exc)[:220]
                     state.reset_timers()
@@ -528,15 +604,18 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                 row = dict(gpu, uuid=uuid, baseline_mhz=baseline,
                            target_mhz=desired, locked_mhz=observed, mode=mode,
                            wait_seconds=wait, emergency=state.emergency,
-                           cooling_at_max=cooling_max, settings=asdict(settings), error=error)
+                           cooling_at_max=cooling_max, reduction_rule=state.reduction_rule,
+                           settings=asdict(settings), error=error)
                 row['pause_reason'] = (('Фиксация ядра в HiveOS отключена' if baseline is None else
                                         f'Частота HiveOS {baseline} МГц ниже минимума '
                                         f'{settings.min_core_mhz} МГц')
                                        if mode == 'paused_hive' else None)
                 rows[uuid] = row
-                if last_modes.get(uuid) != (mode, error):
-                    LOG.info('%s temp=%s mode=%s wait=%s error=%s', uuid, temp, mode, wait, error)
-                    last_modes[uuid] = (mode, error)
+                current_mode = (mode, state.reduction_rule, error)
+                if last_modes.get(uuid) != current_mode:
+                    LOG.info('%s temp=%s mode=%s wait=%s error=%s rule=%s',
+                             uuid, temp, mode, wait, error, state.reduction_rule)
+                    last_modes[uuid] = current_mode
             atomic_json(runtime / 'status.json', dict(updated_at=time.time(),
                         controller_pid=os.getpid(), config_hash=cfg.digest,
                         config_error=config_error, errors=errors, cooling=limits, gpu=rows))

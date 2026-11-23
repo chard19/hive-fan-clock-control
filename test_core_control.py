@@ -14,10 +14,10 @@ S = core.Settings()
 
 class RegulationTests(unittest.TestCase):
     def step(self, state, now, temp=68, maxed=True, base=2700, locked=None, settings=S,
-             growth=True):
+             growth=True, **cooling):
         if locked is None:
             locked = state.current if state.current is not None else 2700
-        return core.decide(state, settings, base, locked, temp, maxed, now, growth)
+        return core.decide(state, settings, base, locked, temp, maxed, now, growth, **cooling)
 
     def test_three_minutes_continuous_and_repeated_steps(self):
         state = core.GPUState()
@@ -42,6 +42,98 @@ class RegulationTests(unittest.TestCase):
         self.step(state, 200, maxed=False)
         self.assertEqual(self.step(state, 280, maxed=True)[0], 2700)
         self.assertEqual(self.step(state, 460)[0], 2650)
+
+    def test_reserve_starts_at_70_and_repeats_fixed_steps_at_60_and_120_seconds(self):
+        state = core.GPUState()
+        settings = replace(S, step_mhz=30)
+        options = dict(maxed=False, case_at_max=True, settings=settings)
+        self.assertEqual(self.step(state, 0, temp=69, **options),
+                         (2700, 'waiting_fans', None))
+        self.assertEqual(self.step(state, 120, temp=69, **options)[0], 2700)
+        self.assertEqual(self.step(state, 125, temp=70, **options),
+                         (2700, 'waiting_hot', 60))
+        self.assertEqual(state.reduction_rule, 'reserve')
+        self.assertEqual(self.step(state, 184, temp=70, **options)[0], 2700)
+        self.assertEqual(self.step(state, 185, temp=70, **options)[0], 2650)
+        self.assertEqual(state.reduction_rule, 'reserve')
+        self.assertEqual(self.step(state, 244, temp=70, **options)[0], 2650)
+        self.assertEqual(self.step(state, 245, temp=70, **options)[0], 2600)
+
+    def test_reserve_does_not_cross_floor_or_reuse_time_after_cooling(self):
+        state = core.GPUState(current=2420)
+        options = dict(maxed=False, case_at_max=True)
+        self.step(state, 0, temp=70, **options)
+        self.assertEqual(self.step(state, 60, temp=70, **options)[0], 2400)
+        self.assertEqual(self.step(state, 120, temp=70, **options)[0], 2400)
+        self.assertEqual(self.step(state, 125, temp=65, **options)[0], 2400)
+        self.assertEqual(self.step(state, 304, temp=65, **options)[0], 2400)
+        self.assertEqual(self.step(state, 305, temp=65, **options)[0], 2450)
+
+    def test_hot_cards_keep_independent_reserve_start_times(self):
+        first, second = core.GPUState(), core.GPUState()
+        options = dict(maxed=False, case_at_max=True)
+        for now in (0, 30, 60):
+            self.step(second, now, temp=69 if now == 0 else 70, **options)
+            self.step(first, now, temp=70, **options)
+        self.assertEqual((first.current, second.current), (2650, 2700))
+        self.assertEqual(self.step(second, 90, temp=70, **options)[0], 2650)
+        self.assertEqual(self.step(first, 90, temp=70, **options)[0], 2650)
+
+    def test_reserve_restarts_after_temperature_or_case_telemetry_interruption(self):
+        for temp, case_at_max in ((69, True), (None, True), (70, False)):
+            with self.subTest(temperature=temp, case_at_max=case_at_max):
+                state = core.GPUState()
+                self.step(state, 0, temp=70, maxed=False, case_at_max=True)
+                self.step(state, 55, temp=temp, maxed=False, case_at_max=case_at_max)
+                self.assertEqual(self.step(state, 60, temp=70, maxed=False,
+                                           case_at_max=True)[2], 60)
+                self.assertEqual(self.step(state, 120, temp=70, maxed=False,
+                                           case_at_max=True)[0], 2650)
+
+    def test_parallel_delays_apply_one_step_and_restart_both_timers(self):
+        # A distinct regular step identifies which rule won, including when both are due.
+        settings = replace(S, step_mhz=30)
+        for reserve_start, due, expected_clock, rule in (
+                (110, 170, 2650, 'reserve'),
+                (120, 180, 2650, 'reserve'),
+                (160, 180, 2670, 'regular')):
+            with self.subTest(reserve_start=reserve_start, rule=rule):
+                state = core.GPUState()
+                options = dict(case_at_max=True, settings=settings)
+                self.step(state, 0, temp=68, **options)
+                self.step(state, reserve_start, temp=70, **options)
+                self.assertEqual(self.step(state, due - 1, temp=70, **options)[0], 2700)
+                self.assertEqual(self.step(state, due, temp=70, **options)[0], expected_clock)
+                self.assertEqual(state.reduction_rule, rule)
+                self.assertEqual(self.step(state, due + 59, temp=70, **options)[0], expected_clock)
+                self.assertEqual(self.step(state, due + 60, temp=70, **options)[0],
+                                 expected_clock - 50)
+
+    def test_emergency_outranks_a_reserve_step_due_at_the_same_poll(self):
+        state = core.GPUState()
+        self.step(state, 0, temp=70, maxed=False, case_at_max=True)
+        self.assertEqual(self.step(state, 60, temp=75, maxed=False, case_at_max=True),
+                         (2400, 'emergency', None))
+
+    def test_case_maximum_change_restarts_both_delays_even_if_both_remain_at_maximum(self):
+        for temp, hold in ((68, 180), (70, 60)):
+            with self.subTest(temperature=temp):
+                state = core.GPUState()
+                options = dict(temp=temp, case_at_max=True, gpu_max=90)
+                self.step(state, 0, case_max=70, **options)
+                self.assertEqual(self.step(state, hold - 5, case_max=75, **options)[2], hold)
+                self.assertEqual(self.step(state, hold, case_max=75, **options)[0], 2700)
+                self.assertEqual(self.step(state, 2 * hold - 5, case_max=75, **options)[0], 2650)
+
+    def test_gpu_maximum_change_restarts_only_regular_delay(self):
+        normal, reserve = core.GPUState(), core.GPUState()
+        self.step(normal, 0, case_at_max=True, gpu_max=90)
+        self.assertEqual(self.step(normal, 175, case_at_max=True, gpu_max=75)[2], 180)
+        self.assertEqual(self.step(normal, 180, case_at_max=True, gpu_max=75)[0], 2700)
+        self.assertEqual(self.step(normal, 355, case_at_max=True, gpu_max=75)[0], 2650)
+        self.step(reserve, 0, temp=70, case_at_max=True, gpu_max=90)
+        self.assertEqual(self.step(reserve, 55, temp=70, case_at_max=True, gpu_max=75)[2], 5)
+        self.assertEqual(self.step(reserve, 60, temp=70, case_at_max=True, gpu_max=75)[0], 2650)
 
     def test_cards_are_independent_and_uuid_survives_reordering(self):
         states = {u: core.GPUState() for u in IDS}
@@ -258,11 +350,29 @@ class InputTests(unittest.TestCase):
             limits = core.cooling_limits(case, fan, wall_time=105)
             self.assertTrue(limits['case_at_max'])
             self.assertEqual(limits['gpu_max'], 80)
+            self.assertEqual(limits['gpu_fan_threshold_percent'], 78)
             # Editing the actual Hive setting is reflected on the very next read.
             fan.write_text('ENABLED=1\nMAX_FAN=70\n')
             self.assertEqual(core.cooling_limits(case, fan, wall_time=105)['gpu_max'], 70)
-            with self.assertRaises(ValueError):
-                core.cooling_limits(case, fan, wall_time=121)
+            stale = core.cooling_limits(case, fan, wall_time=121)
+            self.assertFalse(stale['case_at_max'])
+            self.assertTrue(stale['case_error'])
+            self.assertEqual(stale['gpu_max'], 70)
+
+    def test_bad_or_individual_autofan_settings_keep_fresh_case_readings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case, fan = (Path(folder) / n for n in ('case', 'fan'))
+            case.write_text(json.dumps({'updated_at': 100, 'pwm_actual_percent': 70,
+                            'applied_config': {'max_pwm_percent': 70}}))
+            for config in ('ENABLED=0\nMAX_FAN=75\n', 'ENABLED=1\nMAX_FAN=invalid\n',
+                           'ENABLED=1\nMAX_FAN=75\nCUSTOM_MODE=1\n'):
+                with self.subTest(config=config):
+                    fan.write_text(config)
+                    limits = core.cooling_limits(case, fan, wall_time=105)
+                    self.assertTrue(limits['case_at_max'])
+                    self.assertEqual(limits['case_max'], 70)
+                    self.assertIsNone(limits['gpu_fan_threshold_percent'])
+                    self.assertTrue(limits['gpu_error'])
 
     def test_missing_card_in_case_controller_keeps_other_cards_protected(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -305,7 +415,8 @@ class InputTests(unittest.TestCase):
 
 class DaemonTests(unittest.TestCase):
     def exercise(self, folder, after_poll=None, bad_storage=False, bad_hive=False,
-                 recover=False, initial_clock=2700, hive_clocks=None):
+                 recover=False, initial_clock=2700, hive_clocks=None,
+                 first_telemetry=None, cooling=None, polls=4, fail_first_apply=False):
         path = Path(folder) / 'config.toml'
         text = Path(__file__).with_name('cryptone-core-control.toml').read_text()
         path.write_text(text.replace('seconds = 180', 'seconds = 5'))
@@ -319,9 +430,9 @@ class DaemonTests(unittest.TestCase):
         class Event:
             count = 0
             def is_set(self):
-                return self.count >= 4
+                return self.count >= polls
             def set(self):
-                self.count = 4
+                self.count = polls
             def wait(self, seconds):
                 self.count += 1
                 if after_poll:
@@ -330,6 +441,8 @@ class DaemonTests(unittest.TestCase):
         original_write = core.atomic_json
         def apply(uuid, target):
             calls.append((uuid, target))
+            if fail_first_apply and len(calls) == 1:
+                raise RuntimeError('simulated clock command failure')
             locks[uuid] = target
             return target
         def write(p, data):
@@ -339,6 +452,8 @@ class DaemonTests(unittest.TestCase):
         gpus = {u: dict(index=i, bus=f'{i+2:02x}:00.0', temperature_c=
                         (65 if recover else 75 if bad_hive else 68) if i == 0 else 65,
                         actual_core_mhz=2692, fan_percent=80) for i, u in enumerate(IDS)}
+        if first_telemetry is not None:
+            gpus[IDS[0]].update(first_telemetry)
         with patch.object(core.threading, 'Event', return_value=event), \
                  patch.object(core.signal, 'signal'), \
                  patch.object(core, 'notify'), \
@@ -348,8 +463,9 @@ class DaemonTests(unittest.TestCase):
                  patch.object(core, 'hive_baselines', side_effect=(ValueError('bad HiveOC')
                                    if bad_hive else lambda _: (hive_clocks or
                                                               dict.fromkeys(IDS, 2700)))), \
-                 patch.object(core, 'cooling_limits', return_value=dict(
-                     case_pwm=55, case_max=55, gpu_max=80, case_at_max=True)), \
+                 patch.object(core, 'cooling_limits', side_effect=cooling, return_value=dict(
+                     case_pwm=55, case_max=55, gpu_max=80, case_at_max=True,
+                     gpu_fan_threshold_percent=78, case_error=None, gpu_error=None)), \
                  patch.object(core, 'apply_clock', side_effect=apply), \
                  patch.object(core, 'atomic_json', side_effect=write):
             core.run(cfg, path, Path(folder) / 'state.json', Path(folder) / 'runtime')
@@ -361,6 +477,69 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(calls, [(IDS[0], 2650), (IDS[0], 2600), (IDS[0], 2550)])
         self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2550)
         self.assertEqual(status['gpu'][IDS[1]]['locked_mhz'], 2700)
+
+    def test_running_daemon_uses_lower_autofan_limit_on_next_poll(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case, fan = (Path(folder) / n for n in ('case', 'fan'))
+            case.write_text(json.dumps({'updated_at': 100, 'pwm_actual_percent': 70,
+                            'applied_config': {'max_pwm_percent': 70}}))
+            fan.write_text('ENABLED=1\nMAX_FAN=90\n')
+            def edit(count, _path):
+                if count == 2:
+                    fan.write_text('ENABLED=1\nMAX_FAN=75\n')
+            reader = core.cooling_limits
+            calls, status = self.exercise(folder, after_poll=edit, first_telemetry={'fan_percent': 73},
+                                          cooling=lambda: reader(case, fan, wall_time=105))
+        self.assertEqual(calls, [(IDS[0], 2650)])
+        self.assertEqual(status['gpu'][IDS[0]]['reduction_rule'], 'regular')
+        self.assertEqual(status['cooling']['gpu_max'], 75)
+        self.assertEqual(status['cooling']['gpu_fan_threshold_percent'], 73)
+
+    def test_running_daemon_reserve_works_without_autofan_or_gpu_fan_readings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case, fan = (Path(folder) / n for n in ('case', 'fan'))
+            case.write_text(json.dumps({'updated_at': 100, 'pwm_actual_percent': 70,
+                            'applied_config': {'max_pwm_percent': 70}}))
+            fan.write_text('ENABLED=0\nMAX_FAN=90\n')
+            reader = core.cooling_limits
+            calls, status = self.exercise(folder, polls=13,
+                                          first_telemetry={'temperature_c': 70, 'fan_percent': None},
+                                          cooling=lambda: reader(case, fan, wall_time=105))
+        self.assertEqual(calls, [(IDS[0], 2650)])
+        self.assertEqual(status['gpu'][IDS[0]]['reduction_rule'], 'reserve')
+        self.assertEqual(status['gpu'][IDS[1]]['locked_mhz'], 2700)
+        self.assertTrue(status['errors'])
+
+    def test_running_daemon_does_not_treat_stale_full_case_pwm_as_permission_to_reduce(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case, fan = (Path(folder) / n for n in ('case', 'fan'))
+            case.write_text(json.dumps({'updated_at': 100, 'pwm_actual_percent': 70,
+                            'applied_config': {'max_pwm_percent': 70}}))
+            fan.write_text('ENABLED=1\nMAX_FAN=75\n')
+            reader = core.cooling_limits
+            calls, status = self.exercise(folder, polls=13, first_telemetry={'temperature_c': 70},
+                                          cooling=lambda: reader(case, fan, wall_time=121))
+        self.assertEqual(calls, [])
+        self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2700)
+        self.assertIsNone(status['gpu'][IDS[0]]['reduction_rule'])
+        self.assertTrue(status['errors'])
+
+    def test_running_daemon_applies_final_reserve_step_inside_readback_tolerance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, polls=26, initial_clock=2410,
+                                          hive_clocks=dict.fromkeys(IDS, 2410),
+                                          first_telemetry={'temperature_c': 70, 'fan_percent': 73})
+        self.assertEqual(calls, [(IDS[0], 2400)])
+        self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2400)
+
+    def test_running_daemon_retries_unconfirmed_small_reserve_step(self):
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, polls=26, initial_clock=2410,
+                                          hive_clocks=dict.fromkeys(IDS, 2410),
+                                          first_telemetry={'temperature_c': 70, 'fan_percent': 73},
+                                          fail_first_apply=True)
+        self.assertEqual(calls, [(IDS[0], 2400), (IDS[0], 2400)])
+        self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2400)
 
     def test_daemon_follows_individual_hive_limits_above_and_below_old_cap(self):
         baselines = dict(zip(IDS, (2900, 3000, 2750, 2850)))

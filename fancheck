@@ -97,6 +97,12 @@ def fan_settings(cfg):
     return {key: cfg[key] for key in FIELDS}
 
 
+def gpu_fan_maximum(status):
+    cooling = status.get('cooling')
+    maximum = cooling.get('gpu_max') if isinstance(cooling, dict) else None
+    return maximum if number(maximum) and 1 <= maximum <= 100 else None
+
+
 def read_pwm(control, cfg):
     state = control['Fan'](cfg).state()
     raw, mode = state['pwm_raw'], state['pwm_mode']
@@ -223,11 +229,9 @@ def collect():
         expected = None
         core['warnings'].append(f'Конфигурация GPU недоступна: {exc}')
     validate_gpus(core, expected)
-    cooling = core['status'].get('cooling')
-    if (not isinstance(cooling, dict) or not number(cooling.get('gpu_max')) or
-            not 1 <= cooling['gpu_max'] <= 100):
+    if (core['current'] and gpu_fan_maximum(core['status']) is None and
+            not core['status'].get('errors')):
         core['warnings'].append('Максимум вентиляторов GPU недоступен')
-        core['status']['cooling'] = None
     for section in (case, core):
         section['warnings'] = list(dict.fromkeys(section['warnings']))
     return {'case': case, 'core': core}
@@ -267,14 +271,20 @@ def render(report):
         mode = shown.get('mode', 'показания недоступны')
         if not isinstance(mode, str):
             mode = 'показания недоступны'
+        label = MODES.get(mode, mode)
+        if shown.get('reduction_rule') == 'reserve':
+            if mode == 'waiting_hot':
+                label = 'ожидание резервного снижения'
+            elif mode == 'reduced':
+                label = 'резервное снижение'
         wait = shown.get('wait_seconds')
         suffix = f'; осталось {value(wait)} с' if number(wait) else ''
-        print(f"  {MODES.get(mode, mode)}{suffix}")
+        print(f'  {label}{suffix}')
         if shown.get('pause_reason'):
             print('  Причина:', shown['pause_reason'])
-    cooling = core['status'].get('cooling')
-    maximum = cooling.get('gpu_max') if isinstance(cooling, dict) and core['current'] else None
-    print(f"  Максимум вентиляторов GPU: {value(maximum)}%")
+    maximum = gpu_fan_maximum(core['status']) if core['current'] else None
+    maximum_text = f'{value(maximum)}%' if maximum is not None else '—'
+    print(f'  Максимум вентиляторов GPU: {maximum_text}')
     for label, section in (('Корпус', case), ('Ядро', core)):
         messages = list(dict.fromkeys(section['warnings']))
         if messages:

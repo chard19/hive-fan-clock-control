@@ -108,6 +108,51 @@ class CombinedStatusTests(StatusFixture, unittest.TestCase):
         self.assertEqual(report['case']['pwm']['percent'], 58.8)
         self.assertEqual(len(report['core']['status']['gpu']), 4)
 
+    def test_reserve_status_shows_countdown_and_hive_fan_maximum(self):
+        self.core['gpu'][self.ids[0]].update(
+            mode='waiting_hot', wait_seconds=35, reduction_rule='reserve')
+        self.core['gpu'][self.ids[1]].update(
+            mode='reduced', wait_seconds=60, reduction_rule='reserve')
+        self.core['gpu'][self.ids[2]].update(
+            mode='waiting_hot', wait_seconds=87, reduction_rule='regular')
+        self.core['cooling'].update(gpu_max=75, gpu_fan_threshold_percent=73)
+        self.write_status()
+
+        rc, text = self.command()
+        self.assertEqual(rc, 0)
+        self.assertIn('ожидание резервного снижения; осталось 35 с', text)
+        self.assertIn('резервное снижение; осталось 60 с', text)
+        self.assertIn('ожидание снижения; осталось 87 с', text)
+        self.assertIn('Максимум вентиляторов GPU: 75%', text)
+
+        rc, raw = self.command(['--json'])
+        self.assertEqual(rc, 0)
+        status = json.loads(raw)['core']['status']
+        self.assertEqual(status['gpu'][self.ids[0]], self.core['gpu'][self.ids[0]])
+        self.assertEqual(status['cooling'], self.core['cooling'])
+
+    def test_autofan_error_keeps_case_fan_and_reserve_status(self):
+        self.core['gpu'][self.ids[0]].update(
+            mode='waiting_hot', wait_seconds=15, reduction_rule='reserve')
+        self.core['cooling'].update(
+            case_pwm=59, case_max=59, case_at_max=True,
+            gpu_max=None, gpu_fan_threshold_percent=None)
+        self.core['errors'] = ['AutoFan: configuration unavailable']
+        self.write_status()
+
+        rc, text = self.command()
+        self.assertEqual(rc, 1)
+        self.assertIn('ожидание резервного снижения; осталось 15 с', text)
+        self.assertIn('Максимум вентиляторов GPU: —', text)
+        self.assertIn('AutoFan: configuration unavailable', text)
+        self.assertNotIn('Максимум вентиляторов GPU недоступен', text)
+
+        rc, raw = self.command(['--json'])
+        self.assertEqual(rc, 1)
+        core = json.loads(raw)['core']
+        self.assertEqual(core['status']['cooling'], self.core['cooling'])
+        self.assertEqual(core['warnings'], self.core['errors'])
+
     def test_stale_future_or_other_process_never_confirms_applied_settings(self):
         for changes in ({'updated_at':50},{'updated_at':110},{'controller_pid':99}):
             with self.subTest(changes=changes):
