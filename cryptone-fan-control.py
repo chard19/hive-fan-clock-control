@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Control one explicitly selected Linux hwmon PWM from NVIDIA temperatures."""
 import argparse
+from contextlib import contextmanager
 import csv
+import errno
 import fcntl
 import hashlib
 import json
@@ -20,7 +22,27 @@ CONFIG_PATH = Path('/etc/cryptone-fan-control.json')
 HWMON_ROOT = Path('/sys/class/hwmon')
 UUID_RE = re.compile(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z')
 RUNTIME = Path('/run/cryptone-fan-control')
+MAX_CONFIG_BYTES = 65536
+MAX_STATUS_BYTES = 262144
 LOG = logging.getLogger('cryptone-fans')
+
+
+def finite_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def validate_config_depth(item, depth=0):
+    if depth > 64:
+        raise ValueError('Configuration nesting is too deep')
+    if isinstance(item, dict):
+        for value in item.values():
+            validate_config_depth(value, depth + 1)
+    elif isinstance(item, list):
+        for value in item:
+            validate_config_depth(value, depth + 1)
 
 
 def validate_config(cfg):
@@ -31,7 +53,7 @@ def validate_config(cfg):
                'fall_interval_seconds', 'deadband_c')
     for key in numeric:
         value = cfg.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if not finite_number(value):
             raise ValueError(f'Invalid numeric setting: {key}')
     for key in ('target_c', 'min_pwm_percent', 'max_pwm_percent'):
         if not isinstance(cfg[key], int):
@@ -51,8 +73,7 @@ def validate_config(cfg):
     if not 0 <= cfg['deadband_c'] <= 2:
         raise ValueError('Invalid deadband')
     startup = cfg.get('startup_pwm_percent', 55)
-    if (isinstance(startup, bool) or not isinstance(startup, (int, float)) or
-            not math.isfinite(startup) or not 30 <= startup <= 100):
+    if not finite_number(startup) or not 30 <= startup <= 100:
         raise ValueError('Invalid startup PWM')
     ids = cfg.get('expected_gpu_uuids')
     if (not isinstance(ids, list) or not ids or
@@ -60,6 +81,11 @@ def validate_config(cfg):
             len(set(ids)) != len(ids)):
         raise ValueError('A nonempty list of distinct NVIDIA GPU UUIDs is required')
     validate_selector(cfg.get('controller'))
+    try:
+        validate_config_depth(cfg)
+        json.dumps(cfg, sort_keys=True, allow_nan=False, ensure_ascii=False).encode()
+    except (RecursionError, TypeError) as exc:
+        raise ValueError('Invalid configuration value') from exc
     return cfg
 
 
@@ -113,10 +139,22 @@ def assert_live_change(old, new):
 
 def load_config(path):
     with Path(path).open('rb') as stream:
-        data = stream.read(65537)
-    if len(data) > 65536:
+        data = stream.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:
         raise ValueError('Configuration is too large')
-    return validate_config(json.loads(data))
+    try:
+        return validate_config(json.loads(data, object_pairs_hook=unique_fields))
+    except RecursionError as exc:
+        raise ValueError('Configuration is nested too deeply') from exc
+
+
+def unique_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'Duplicate configuration field: {key}')
+        result[key] = value
+    return result
 
 
 def config_hash(cfg):
@@ -150,7 +188,7 @@ def read_temperatures(cfg):
 
 
 def pwm_value(percent, cfg=None):
-    if not math.isfinite(percent) or not 0 < percent <= 100:
+    if not finite_number(percent) or not 0 < percent <= 100:
         raise ValueError('Invalid PWM percentage')
     value = round(percent * 255 / 100)
     if cfg is not None and percent != 100:
@@ -168,19 +206,24 @@ class Fan:
         if len(candidates) != 1:
             raise RuntimeError('Configured hwmon PWM channel was not found uniquely')
         self.path = Path(candidates[0]['hwmon_path'])
-        self.pwm = self.path / f'pwm{self.selector["pwm_channel"]}'
-        self.enable = self.path / f'{self.pwm.name}_enable'
+        # Pin the selected sysfs node. A hwmon class symlink can be re-used
+        # for a different device while this process is still running.
+        self.node = self.path.resolve(strict=True)
+        self.pwm = self.node / f'pwm{self.selector["pwm_channel"]}'
+        self.enable = self.node / f'{self.pwm.name}_enable'
 
     def verify_identity(self):
-        if ((self.path / 'name').read_text().strip() != self.selector['hwmon_name'] or
-                device_identity(self.path) != self.selector['device_path']):
+        if ((self.node / 'name').read_text().strip() != self.selector['hwmon_name'] or
+                device_identity(self.node) != self.selector['device_path']):
             raise RuntimeError('PWM device identity changed; refusing to access another controller')
 
     def state(self):
         self.verify_identity()
-        return {'pwm_raw': int(self.pwm.read_text()),
-                'pwm_mode': int(self.enable.read_text()),
-                'hwmon_path': str(self.path)}
+        raw = int(self.pwm.read_text())
+        mode = int(self.enable.read_text())
+        if not 0 <= raw <= 255 or mode < 0:
+            raise RuntimeError('Invalid PWM hardware reading')
+        return {'pwm_raw': raw, 'pwm_mode': mode, 'hwmon_path': str(self.path)}
 
     def set(self, percent, cfg=None):
         value = pwm_value(percent, cfg)
@@ -188,12 +231,20 @@ class Fan:
         # it87 may report mode 0 for the manual full-speed value 255.
         # Preload full duty before taking manual control, avoiding an old low duty.
         if int(self.enable.read_text()) != 1:
-            self.pwm.write_text('255\n')
+            try:
+                self.pwm.write_text('255\n')
+            except OSError as exc:
+                if exc.errno != errno.EBUSY:
+                    raise
+                # NCT6775 rejects duty writes in automatic modes. Disable
+                # controller regulation at full speed before going manual.
+                self.enable.write_text('0\n')
             self.enable.write_text('1\n')
         self.pwm.write_text(f'{value}\n')
         state = self.state()
-        if ((state['pwm_mode'] != 1 and not (value == 255 and state['pwm_mode'] == 0)) or
-                abs(state['pwm_raw'] - value) > 1):
+        if state['pwm_mode'] == 0 and value == 255:
+            return state
+        if state['pwm_mode'] != 1 or abs(state['pwm_raw'] - value) > 1:
             raise RuntimeError(f'PWM write did not persist: {state}')
         return state
 
@@ -257,10 +308,42 @@ def write_status(status):
     temporary.replace(RUNTIME / 'status.json')
 
 
-def run(fan, cfg, config_path=None):
+@contextmanager
+def controller_lock():
     RUNTIME.mkdir(exist_ok=True)
-    lock = (RUNTIME / 'controller.lock').open('a')
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with (RUNTIME / 'controller.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def previous_emergency():
+    try:
+        with (RUNTIME / 'status.json').open('rb') as stream:
+            raw = stream.read(MAX_STATUS_BYTES + 1)
+        if len(raw) <= MAX_STATUS_BYTES:
+            status = json.loads(raw)
+            if isinstance(status, dict):
+                return status.get('mode') == 'emergency' or status.get('emergency_latched') is True
+    except (OSError, ValueError, RecursionError):
+        pass
+    return False
+
+
+def apply_failsafe(fan):
+    state = fan.set(100)
+    write_status(dict(state, updated_at=time.time(), mode='failsafe',
+                      pwm_requested_percent=100, pwm_actual_percent=100,
+                      emergency_latched=previous_emergency(),
+                      error='Controller stopped or failed; full cooling applied'))
+    return state
+
+
+def run(fan, cfg, config_path=None):
+    with controller_lock():
+        run_locked(fan, cfg, config_path)
+
+
+def run_locked(fan, cfg, config_path):
     binding = RUNTIME / 'hardware.json'
     temporary = binding.with_suffix('.tmp')
     temporary.write_text(json.dumps({'controller': cfg['controller']}) + '\n')
@@ -269,6 +352,8 @@ def run(fan, cfg, config_path=None):
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stopping.set())
     control = Controller(cfg)
+    control.emergency = previous_emergency()
+    first_sample = True
     last_summary, last_logged = 0, None
     try:
         fan.set(100)
@@ -293,6 +378,9 @@ def run(fan, cfg, config_path=None):
                 error = f'{type(exc).__name__}: {str(exc)[:200]}'
             if config_error:
                 error = f'Invalid live configuration: {config_error}'
+            if first_sample and hottest is not None and hottest > cfg['recovery_c']:
+                control.emergency = True
+            first_sample = False
             requested = control.update(None if config_error else hottest, started)
             state = fan.set(requested, cfg)
             mode = 'emergency' if control.emergency else 'normal'
@@ -301,7 +389,8 @@ def run(fan, cfg, config_path=None):
             status = dict(state, updated_at=time.time(), mode=mode,
                           gpu_temperatures=readings, hottest_c=hottest,
                           target_c=cfg['target_c'], pwm_requested_percent=requested,
-                          pwm_actual_percent=round(state['pwm_raw'] * 100 / 255, 1),
+                          pwm_actual_percent=100 if state['pwm_mode'] == 0 else
+                          round(state['pwm_raw'] * 100 / 255, 1),
                           target_unmet_at_limit=limited, error=error,
                           config_error=config_error, applied_config=cfg,
                           config_hash=config_hash(cfg), controller_pid=os.getpid())
@@ -318,7 +407,6 @@ def run(fan, cfg, config_path=None):
     finally:
         fan.set(100)
         LOG.info('Controller exiting; selected PWM set to 100%')
-        lock.close()
 
 
 def main():
@@ -334,17 +422,11 @@ def main():
         print(json.dumps(discover_controllers(), indent=2))
         return
     if args.failsafe:
-        RUNTIME.mkdir(exist_ok=True)
         # Never follow an unaccepted live edit to a different physical channel.
-        binding = RUNTIME / 'hardware.json'
-        selected = json.loads(binding.read_text()) if binding.exists() else load_config(args.config)
-        with (RUNTIME / 'controller.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            state = Fan(selected).set(100)
-            write_status(dict(state, updated_at=time.time(), mode='failsafe',
-                              pwm_requested_percent=100, pwm_actual_percent=100,
-                              error='Controller stopped or failed; full cooling applied'))
-            print(json.dumps(state))
+        with controller_lock():
+            binding = RUNTIME / 'hardware.json'
+            selected = json.loads(binding.read_text()) if binding.exists() else load_config(args.config)
+            print(json.dumps(apply_failsafe(Fan(selected))))
         return
     cfg = load_config(args.config)
     fan = Fan(cfg)

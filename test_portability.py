@@ -160,6 +160,8 @@ class StatusRegressions(test_fancheck.StatusFixture, unittest.TestCase):
                              ({'mode': 'emergency'}, 'Аварийное охлаждение')):
             with self.subTest(change=change):
                 self.case.update(change)
+                if self.case['mode'] == 'emergency':
+                    self.hw['pwm_raw'] = 255
                 self.write_status()
                 rc, rendered = self.command()
                 self.assertEqual(rc, 1)

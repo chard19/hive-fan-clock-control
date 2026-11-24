@@ -5,9 +5,10 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HERE = Path(__file__).resolve().parent
 loader = importlib.machinery.SourceFileLoader('fanset', str(HERE / 'fanset'))
@@ -30,7 +31,6 @@ class CommandTests(unittest.TestCase):
         self.output = io.StringIO()
         self.patches = [patch.object(fanset, 'CONFIG_PATH', self.path),
                         patch.object(fanset, 'load_control', return_value=control),
-                        patch.object(fanset, 'service_pid', return_value=123),
                         patch.object(fanset.os, 'geteuid', return_value=0)]
         for item in self.patches:
             item.start()
@@ -90,7 +90,7 @@ class CommandTests(unittest.TestCase):
 
     def test_read_only_show_does_not_write_or_wait(self):
         with patch.object(fanset, 'read_status', return_value={}), \
-                patch.object(fanset, 'service_status', return_value='inactive'):
+                patch.object(fanset, 'service_info', return_value=('inactive', 0)):
             self.assertEqual(self.command(['--show']), 0)
         self.assertEqual(self.path.read_bytes(), self.original)
         self.assertIn('Сохранено:', self.output.getvalue())
@@ -98,21 +98,45 @@ class CommandTests(unittest.TestCase):
 
     def test_acknowledgement_requires_matching_fresh_valid_status(self):
         valid = {'updated_at': 100, 'config_hash': control.config_hash(self.cfg),
-                 'config_error': None, 'controller_pid': 123}
+                 'config_error': None, 'controller_pid': 123, 'applied_config': self.cfg,
+                 'mode': 'normal', 'pwm_actual_percent': 55}
         invalid = dict(valid, config_error='broken config')
         with patch.object(fanset, 'read_status', side_effect=[invalid, valid]), \
-                patch.object(fanset, 'service_status', return_value='active'), \
+                patch.object(fanset, 'service_info', return_value=('active', 123)), \
                 patch.object(fanset.time, 'time', return_value=100), \
                 patch.object(fanset.time, 'sleep'):
             self.assertEqual(fanset.wait_applied(control, self.cfg), valid)
         for status in (dict(valid, updated_at=50), dict(valid, config_hash='other'),
-                       dict(valid, controller_pid=321), invalid):
+                       dict(valid, controller_pid=321), dict(valid, mode='failsafe'),
+                       dict(valid, pwm_actual_percent=None), dict(valid, pwm_actual_percent=0),
+                       dict(valid, mode='emergency'), dict(valid, applied_config={}), invalid):
             with patch.object(fanset, 'read_status', return_value=status), \
-                    patch.object(fanset, 'service_status', return_value='active'), \
+                    patch.object(fanset, 'service_info', return_value=('active', 123)), \
                     patch.object(fanset.time, 'time', return_value=100), \
                     patch.object(fanset.time, 'monotonic', side_effect=[0, 0, 16]), \
                     patch.object(fanset.time, 'sleep'):
                 self.assertIsNone(fanset.wait_applied(control, self.cfg))
+
+    def test_systemd_timeout_after_write_is_saved_but_unconfirmed(self):
+        cfg = fanset.candidate_config(control, self.cfg, [66, 35, 70])
+        status = {'updated_at': 100, 'config_hash': control.config_hash(cfg),
+                  'applied_config': cfg, 'controller_pid': 123, 'mode': 'normal',
+                  'pwm_actual_percent': 55}
+        with contextlib.redirect_stdout(self.output), contextlib.redirect_stderr(self.output), \
+                patch.object(fanset, 'read_status', return_value=status), \
+                patch.object(fanset.subprocess, 'run', side_effect=subprocess.TimeoutExpired('systemctl', 1)), \
+                patch.object(fanset.time, 'time', return_value=100), \
+                patch.object(fanset.time, 'monotonic', side_effect=[0, 0, 16]), \
+                patch.object(fanset.time, 'sleep'):
+            self.assertEqual(fanset.main(['66', '35', '70']), 2)
+        self.assertEqual(control.load_config(self.path), cfg)
+        self.assertIn('применение не подтверждено', self.output.getvalue())
+
+    def test_expanded_config_over_size_limit_does_not_replace_working_file(self):
+        self.path.write_text(json.dumps(dict(self.cfg, notes=[0] * 10000), separators=(',', ':')))
+        before = self.path.read_bytes()
+        self.assertEqual(self.command(['66', '35', '70']), 1)
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 class ReloadTests(unittest.TestCase):
@@ -139,6 +163,54 @@ class ReloadTests(unittest.TestCase):
         self.assertEqual(c.update(71, 10), 100)
         self.assertEqual(c.update(71, 15), 100)
         self.assertEqual(c.update(71, 20), 80)
+
+    def test_competing_controller_and_failsafe_cannot_write_hardware(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(control, 'RUNTIME', Path(directory)), \
+                patch.object(control, 'Fan') as fan_factory:
+            path = Path(directory) / 'config.json'
+            path.write_text(json.dumps(self.cfg))
+            with control.controller_lock():
+                for flag in ([], ['--failsafe']):
+                    with self.subTest(flag=flag), \
+                            patch('sys.argv', ['case-control', '--config', str(path), *flag]), \
+                            self.assertRaises(BlockingIOError):
+                        control.main()
+            fan_factory.return_value.set.assert_not_called()
+
+    def test_restart_preserves_emergency_and_starting_hot_waits_for_recovery(self):
+        for prior_emergency, temperatures, expected in (
+                (True, [69, 69, 69], [100, 100, 100, self.cfg['max_pwm_percent'], 100]),
+                (False, [74, 70, 70, 70], [100, 100, 100, 100, self.cfg['max_pwm_percent'], 100])):
+            with self.subTest(prior_emergency=prior_emergency), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(control, 'RUNTIME', Path(directory)):
+                fan = Mock()
+                fan.set.side_effect = lambda percent, cfg=None: {
+                    'pwm_raw': control.pwm_value(percent, cfg), 'pwm_mode': 1}
+                if prior_emergency:
+                    control.write_status({'mode': 'emergency'})
+                    with control.controller_lock():
+                        control.apply_failsafe(fan)
+                    self.assertTrue(control.previous_emergency())
+                    fan.set.reset_mock()
+
+                class Stop:
+                    cycle = 0
+
+                    def is_set(self):
+                        return self.cycle >= len(temperatures)
+
+                    def wait(self, seconds):
+                        self.cycle += 1
+
+                with patch.object(control.threading, 'Event', Stop), \
+                        patch.object(control.signal, 'signal'), \
+                        patch.object(control, 'notify'), \
+                        patch.object(control, 'read_temperatures',
+                                     side_effect=[dict.fromkeys(self.cfg['expected_gpu_uuids'], temp)
+                                                  for temp in temperatures]):
+                    control.run(fan, self.cfg)
+                self.assertEqual([call.args[0] for call in fan.set.call_args_list], expected)
 
     def test_real_loop_reloads_and_fails_safe_on_invalid_file(self):
         with tempfile.TemporaryDirectory() as directory:

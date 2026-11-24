@@ -16,6 +16,8 @@ CONFIG_PATH = Path('/etc/cryptone-fan-control.json')
 STATUS_PATH = Path('/run/cryptone-fan-control/status.json')
 SERVICE = 'cryptone-fan-control.service'
 ACK_TIMEOUT = 15
+MAX_CONFIG_BYTES = 65536
+MAX_STATUS_BYTES = 262144
 FIELDS = ('target_c', 'min_pwm_percent', 'max_pwm_percent')
 
 
@@ -26,29 +28,48 @@ def load_control():
     return control
 
 
-def service_status():
-    result = subprocess.run(['systemctl', 'is-active', SERVICE],
-                            capture_output=True, text=True, timeout=3, check=False)
-    return result.stdout.strip() or 'unknown'
-
-
-def service_pid():
-    result = subprocess.run(['systemctl', 'show', SERVICE, '--property=MainPID', '--value'],
-                            capture_output=True, text=True, timeout=3, check=False)
-    return int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+def service_info(timeout=3):
+    try:
+        result = subprocess.run(['systemctl', 'show', SERVICE, '-p', 'ActiveState', '-p', 'MainPID'],
+                                capture_output=True, text=True, timeout=timeout, check=False)
+        if result.returncode == 0:
+            fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+            return fields.get('ActiveState', 'unknown'), int(fields.get('MainPID', '0'))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return 'unknown', 0
 
 
 def read_status():
     try:
-        status = json.loads(STATUS_PATH.read_text())
+        with STATUS_PATH.open('rb') as stream:
+            raw = stream.read(MAX_STATUS_BYTES + 1)
+        if len(raw) > MAX_STATUS_BYTES:
+            return {}
+        status = json.loads(raw)
         return status if isinstance(status, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 
 def fresh(status):
     stamp = status.get('updated_at')
-    return isinstance(stamp, (int, float)) and 0 <= time.time() - stamp <= 15
+    now = time.time()
+    return type(stamp) in (int, float) and now - 15 <= stamp <= now
+
+
+def confirms(status, cfg, digest):
+    pwm = status.get('pwm_actual_percent')
+    if (not fresh(status) or status.get('config_hash') != digest or
+            status.get('applied_config') != cfg or status.get('config_error') or
+            type(status.get('controller_pid')) is not int or
+            type(pwm) not in (int, float) or not 0 <= pwm <= 100):
+        return False
+    mode = status.get('mode')
+    if mode == 'emergency':
+        return pwm >= 99.6
+    return (mode == 'normal' and
+            cfg['min_pwm_percent'] - 0.4 <= pwm <= cfg['max_pwm_percent'] + 0.4)
 
 
 def describe(cfg):
@@ -59,20 +80,21 @@ def describe(cfg):
 def show(control):
     cfg = control.load_config(CONFIG_PATH)
     status = read_status()
-    state = service_status()
+    state, pid = service_info()
+    active_status = state == 'active' and status.get('controller_pid') == pid and pid > 0
     print(f'Сохранено: {describe(cfg)}')
     print(f'Служба: {state}')
-    applied = status.get('applied_config')
-    if isinstance(applied, dict) and all(key in applied for key in FIELDS):
-        current = (fresh(status) and state == 'active' and
-                   status.get('controller_pid', 0) == service_pid() > 0)
+    try:
+        applied = control.validate_config(status.get('applied_config'))
+    except (ValueError, TypeError, RecursionError):
+        applied = None
+    if applied is not None:
+        current = active_status and confirms(status, applied, control.config_hash(applied))
         print(f"{'Применено' if current else 'Последнее применённое'}: {describe(applied)}")
         if current:
             print(f"PWM сейчас: {status.get('pwm_actual_percent')}%; "
                   f"горячая GPU: {status.get('hottest_c')} °C; режим: {status.get('mode')}")
-    if (state != 'active' or not fresh(status) or status.get('config_error') or
-            status.get('controller_pid', 0) != service_pid() or
-            status.get('config_hash') != control.config_hash(cfg)):
+    if not active_status or not confirms(status, cfg, control.config_hash(cfg)):
         print('Применение сохранённых настроек пока не подтверждено.')
     if status.get('error'):
         print(f"Последняя ошибка: {status['error']}")
@@ -106,13 +128,15 @@ def candidate_config(control, cfg, values):
 
 
 def atomic_write(path, cfg):
+    data = (json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False) + '\n').encode()
+    if len(data) > MAX_CONFIG_BYTES:
+        raise ValueError('Файл настроек после сохранения превысит 64 КиБ.')
     descriptor, name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
     temporary = Path(name)
     try:
-        with os.fdopen(descriptor, 'w') as stream:
+        with os.fdopen(descriptor, 'wb') as stream:
             os.fchmod(stream.fileno(), 0o644)
-            json.dump(cfg, stream, ensure_ascii=False, indent=2, allow_nan=False)
-            stream.write('\n')
+            stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -128,13 +152,13 @@ def atomic_write(path, cfg):
 def wait_applied(control, cfg):
     digest = control.config_hash(cfg)
     deadline = time.monotonic() + ACK_TIMEOUT
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         status = read_status()
-        if (fresh(status) and status.get('config_hash') == digest and
-                not status.get('config_error') and service_status() == 'active' and
-                status.get('controller_pid', 0) == service_pid() > 0):
-            return status
-        time.sleep(0.25)
+        if confirms(status, cfg, digest):
+            state, pid = service_info(timeout=min(3, remaining))
+            if state == 'active' and status.get('controller_pid') == pid and pid > 0 and fresh(status):
+                return status
+        time.sleep(min(0.25, remaining))
     return None
 
 
