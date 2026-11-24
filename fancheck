@@ -49,6 +49,17 @@ def diagnostic_text(item):
                    for character in str(item))
 
 
+def validate_status_depth(item, depth=0):
+    if depth > 96:
+        raise ValueError('слишком глубокая вложенность JSON-статуса')
+    if isinstance(item, dict):
+        for value in item.values():
+            validate_status_depth(value, depth + 1)
+    elif isinstance(item, list):
+        for value in item:
+            validate_status_depth(value, depth + 1)
+
+
 def read_object(path):
     with Path(path).open('rb') as stream:
         raw = stream.read(MAX_STATUS_BYTES + 1)
@@ -76,6 +87,7 @@ def read_object(path):
                       object_pairs_hook=unique_object)
     if not isinstance(data, dict):
         raise ValueError('ожидался JSON-объект')
+    validate_status_depth(data)
     return data
 
 

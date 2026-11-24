@@ -34,6 +34,17 @@ def finite_number(value):
         return False
 
 
+def validate_config_depth(item, depth=0):
+    if depth > 64:
+        raise ValueError('Configuration nesting is too deep')
+    if isinstance(item, dict):
+        for value in item.values():
+            validate_config_depth(value, depth + 1)
+    elif isinstance(item, list):
+        for value in item:
+            validate_config_depth(value, depth + 1)
+
+
 def validate_config(cfg):
     if not isinstance(cfg, dict):
         raise ValueError('Configuration must be a JSON object')
@@ -71,6 +82,7 @@ def validate_config(cfg):
         raise ValueError('A nonempty list of distinct NVIDIA GPU UUIDs is required')
     validate_selector(cfg.get('controller'))
     try:
+        validate_config_depth(cfg)
         json.dumps(cfg, sort_keys=True, allow_nan=False, ensure_ascii=False).encode()
     except (RecursionError, TypeError) as exc:
         raise ValueError('Invalid configuration value') from exc

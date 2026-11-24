@@ -259,7 +259,8 @@ class CombinedStatusTests(StatusFixture, unittest.TestCase):
                 self.assertNotIn('Аварийное охлаждение 100%', output)
 
     def test_corrupt_status_keeps_other_service_and_emits_strict_json(self):
-        for field in ('1e9999', '9' * 400, '[' * 1100 + '0' + ']' * 1100, 'NaN',
+        for field in ('1e9999', '9' * 400, '[' * 100 + '0' + ']' * 100,
+                      '[' * 1100 + '0' + ']' * 1100, 'NaN',
                       '100,"updated_at":101'):
             with self.subTest(prefix=field[:15]):
                 self.core_path.write_text('{"updated_at":' + field + '}')

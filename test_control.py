@@ -87,11 +87,12 @@ class SafetyTests(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     control.load_config(path)
 
-    def test_nonfinite_extension_fields_duplicate_keys_and_overflow_fail_validation(self):
+    def test_malformed_nested_fields_duplicate_keys_and_overflow_fail_validation(self):
         raw = json.dumps(self.cfg)
         cases = [raw[:-1] + ', "extra": [1e9999]}',
                  raw[:-1] + ', "extra": NaN}',
                  raw[:-1] + r', "extra": "\ud800"}',
+                 raw[:-1] + ', "extra": ' + '[' * 80 + '0' + ']' * 80 + '}',
                  raw[:-1] + ', "target_c": 70}',
                  json.dumps(dict(self.cfg, rise_interval_seconds=10 ** 400))]
         with tempfile.TemporaryDirectory() as directory:
