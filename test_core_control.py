@@ -269,6 +269,17 @@ class RegulationTests(unittest.TestCase):
         state = core.GPUState(current=2500)
         self.assertEqual(self.step(state, 0, temp=None, locked=2700)[0], 2500)
 
+    def test_missing_lock_still_latches_emergency_but_never_raises_clock(self):
+        state = core.GPUState()
+        self.assertEqual(core.decide(state, S, 2700, None, 75, False, 0, actual_core=2200),
+                         (None, 'sensor_error', None))
+        self.assertTrue(state.emergency)
+        self.assertEqual(state.current, 2400)
+        self.assertEqual(core.decide(state, S, 2700, 0, 73, False, 5, actual_core=2800),
+                         (2400, 'emergency', None))
+        self.assertEqual(core.decide(state, S, None, 0, 75, False, 10, actual_core=2800),
+                         (None, 'paused_hive', None))
+
     def test_restore_reduced_and_emergency_state_on_reboot(self):
         with tempfile.TemporaryDirectory() as folder:
             p = Path(folder) / 'state.json'
@@ -333,6 +344,39 @@ class InputTests(unittest.TestCase):
     def test_bus_formats_normalized(self):
         self.assertEqual(core.bus_key('00000000:02:00.0'), '0000:02:00.0')
         self.assertEqual(core.bus_key('0000:02:00.0'), '0000:02:00.0')
+        self.assertNotEqual(core.bus_key('0000:02:00.0'), core.bus_key('0001:02:00.0'))
+
+    def test_hive_lock_above_driver_command_range_is_an_input_error(self):
+        gpus = {IDS[0]: {'bus': '02:00.0'}}
+        with tempfile.TemporaryDirectory() as folder:
+            oc, detect, bus = (Path(folder) / n for n in ('oc', 'detect', 'bus'))
+            detect.write_text(json.dumps([{'busid': '02:00.0', 'brand': 'nvidia'}]))
+            for value in ('LCLOCK=5001', 'CLOCK=5100', 'CLOCK=5000\nOHGODAPILL_ARGS="1"'):
+                oc.write_text(value)
+                with self.assertRaisesRegex(ValueError, 'exceeds the supported'):
+                    core.hive_baselines(gpus, oc, detect, bus)
+
+    def test_case_status_cannot_claim_automatic_mode_is_at_max(self):
+        with tempfile.TemporaryDirectory() as folder:
+            f = Path(folder) / 'case.json'
+            for mode, speed in ((2, 70), (0, 70), (True, 70), (0, 100), (1, 70)):
+                with self.subTest(mode=mode, speed=speed):
+                    f.write_text(json.dumps(dict(updated_at=100, pwm_actual_percent=speed,
+                                      applied_config={'max_pwm_percent': 70}, pwm_mode=mode)))
+                    if type(mode) is int and (mode == 1 or speed == 100):
+                        self.assertTrue(core.case_cooling(f, 105)['case_at_max'])
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'not confirmed'):
+                            core.case_cooling(f, 105)
+
+    def test_non_object_core_state_does_not_escape_validation(self):
+        cfg = core.load_config(Path(__file__).with_name('cryptone-core-control.toml'))
+        with tempfile.TemporaryDirectory() as folder:
+            f = Path(folder) / 'state.json'
+            for state in ([], {'version': True, 'gpu': {}}, {'version': 1, 'gpu': {IDS[0]: None}}):
+                f.write_text(json.dumps(state))
+                with self.assertRaisesRegex(ValueError, 'Invalid persistent'):
+                    core.restore_states(cfg, f)
 
     def test_invalid_gpu_sensor_does_not_discard_other_cards(self):
         output = (f'0, {IDS[0]}, 00000000:02:00.0, N/A, 2692, 90\n'
@@ -412,20 +456,31 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 core.apply_clock(IDS[0], 2650)
 
+    def test_invalid_readback_cannot_verify_minimum_supported_lock(self):
+        with patch.object(core, 'command'), patch.object(core, 'read_gpus'), \
+             patch.object(core, 'read_locks', return_value={IDS[0]: 499}):
+            with self.assertRaisesRegex(RuntimeError, 'Lock not confirmed'):
+                core.apply_clock(IDS[0], 500)
+
 
 class DaemonTests(unittest.TestCase):
     def exercise(self, folder, after_poll=None, bad_storage=False, bad_hive=False,
                  recover=False, initial_clock=2700, hive_clocks=None,
-                 first_telemetry=None, cooling=None, polls=4, fail_first_apply=False):
+                 first_telemetry=None, cooling=None, polls=4, fail_first_apply=False,
+                 hive_read=None, monotonic=None, before_apply=None, bad_growth_commit=False,
+                 stored_state=None):
         path = Path(folder) / 'config.toml'
         text = Path(__file__).with_name('cryptone-core-control.toml').read_text()
         path.write_text(text.replace('seconds = 180', 'seconds = 5'))
         cfg = core.load_config(path)
+        state_path = Path(folder) / 'state.json'
         locks = dict.fromkeys(IDS, initial_clock)
         if recover:
             locks[IDS[0]] = 2500
             core.atomic_json(Path(folder) / 'state.json', core.persistent_data(
                 {u: core.GPUState(current=locks[u], baseline=2700) for u in IDS}))
+        if stored_state is not None:
+            state_path.write_text(stored_state)
         calls = []
         class Event:
             count = 0
@@ -440,6 +495,8 @@ class DaemonTests(unittest.TestCase):
         event = Event()
         original_write = core.atomic_json
         def apply(uuid, target):
+            if before_apply:
+                before_apply(uuid, target, state_path)
             calls.append((uuid, target))
             if fail_first_apply and len(calls) == 1:
                 raise RuntimeError('simulated clock command failure')
@@ -448,6 +505,8 @@ class DaemonTests(unittest.TestCase):
         def write(p, data):
             if bad_storage and Path(p).name == 'state.json':
                 raise OSError('simulated disk full')
+            if Path(p) == state_path and bad_growth_commit and calls and data['gpu'][IDS[0]]['current'] == 2550:
+                raise OSError('simulated disk full after hardware confirmation')
             original_write(p, data)
         gpus = {u: dict(index=i, bus=f'{i+2:02x}:00.0', temperature_c=
                         (65 if recover else 75 if bad_hive else 68) if i == 0 else 65,
@@ -457,18 +516,19 @@ class DaemonTests(unittest.TestCase):
         with patch.object(core.threading, 'Event', return_value=event), \
                  patch.object(core.signal, 'signal'), \
                  patch.object(core, 'notify'), \
-                 patch.object(core.time, 'monotonic', side_effect=lambda: event.count * 5), \
+                 patch.object(core.time, 'monotonic', side_effect=lambda: (
+                     monotonic(event.count) if monotonic else event.count * 5)), \
                  patch.object(core, 'read_gpus', return_value=gpus), \
                  patch.object(core, 'read_locks', side_effect=lambda _: dict(locks)), \
-                 patch.object(core, 'hive_baselines', side_effect=(ValueError('bad HiveOC')
-                                   if bad_hive else lambda _: (hive_clocks or
-                                                              dict.fromkeys(IDS, 2700)))), \
+                 patch.object(core, 'hive_baselines', side_effect=(hive_read or (
+                                   ValueError('bad HiveOC') if bad_hive else
+                                   lambda _: hive_clocks or dict.fromkeys(IDS, 2700)))), \
                  patch.object(core, 'cooling_limits', side_effect=cooling, return_value=dict(
                      case_pwm=55, case_max=55, gpu_max=80, case_at_max=True,
                      gpu_fan_threshold_percent=78, case_error=None, gpu_error=None)), \
                  patch.object(core, 'apply_clock', side_effect=apply), \
                  patch.object(core, 'atomic_json', side_effect=write):
-            core.run(cfg, path, Path(folder) / 'state.json', Path(folder) / 'runtime')
+            core.run(cfg, path, state_path, Path(folder) / 'runtime')
         return calls, json.loads((Path(folder) / 'runtime/status.json').read_text())
 
     def test_polling_applies_one_card_and_reports_confirmed_lock(self):
@@ -540,6 +600,66 @@ class DaemonTests(unittest.TestCase):
                                           fail_first_apply=True)
         self.assertEqual(calls, [(IDS[0], 2400), (IDS[0], 2400)])
         self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2400)
+
+    def test_no_reserve_step_from_unobserved_interval_during_poll_stall(self):
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, polls=14,
+                                          monotonic=lambda i: i * 5 + (60 if i >= 10 else 0),
+                                          first_telemetry={'temperature_c': 70, 'fan_percent': 73})
+        self.assertEqual(calls, [])
+        self.assertEqual(status['gpu'][IDS[0]]['wait_seconds'], 45)
+
+    def test_daemon_emergency_can_reduce_from_known_high_workload_with_no_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, initial_clock=0,
+                                          first_telemetry={'temperature_c': 75})
+        self.assertEqual(calls, [(IDS[0], 2400)])
+        self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2400)
+
+    def test_recheck_prevents_growth_when_hive_ceiling_changes_before_write(self):
+        def hive_read(gpus):
+            return dict.fromkeys(gpus, 2400 if len(gpus) == 1 else 2700)
+
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, polls=2, recover=True, hive_read=hive_read)
+            saved = json.loads((Path(folder) / 'state.json').read_text())
+        self.assertEqual(calls, [])
+        self.assertEqual(saved['gpu'][IDS[0]]['current'], 2500)
+        self.assertIn('Hive clock profile changed', status['gpu'][IDS[0]]['error'])
+
+    def test_failed_recovery_keeps_the_conservative_cap_on_disk(self):
+        def before_apply(uuid, target, path):
+            self.assertEqual(json.loads(path.read_text())['gpu'][uuid]['current'], 2500)
+            self.assertEqual(target, 2550)
+
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, polls=2, recover=True, fail_first_apply=True,
+                                          before_apply=before_apply)
+            saved = json.loads((Path(folder) / 'state.json').read_text())
+        self.assertEqual(calls, [(IDS[0], 2550)])
+        self.assertEqual(saved['gpu'][IDS[0]]['current'], 2500)
+        self.assertEqual(status['gpu'][IDS[0]]['target_mhz'], 2500)
+        self.assertEqual(status['gpu'][IDS[0]]['mode'], 'apply_error')
+
+    def test_post_write_disk_error_restores_earlier_hardware_cap(self):
+        with tempfile.TemporaryDirectory() as folder:
+            calls, status = self.exercise(folder, polls=3, recover=True, bad_growth_commit=True)
+            saved = json.loads((Path(folder) / 'state.json').read_text())
+        self.assertEqual(calls, [(IDS[0], 2550), (IDS[0], 2500)])
+        self.assertEqual(saved['gpu'][IDS[0]]['current'], 2500)
+        self.assertEqual(status['gpu'][IDS[0]]['locked_mhz'], 2500)
+
+    def test_corrupt_saved_state_preserves_good_rows_and_protects_other_cards(self):
+        stored = json.dumps({'version': 1, 'gpu': {IDS[0]: None,
+                            IDS[1]: {'current': 2500, 'baseline': 2700}}})
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertLogs(core.LOG, level='ERROR'):
+                calls, status = self.exercise(folder, stored_state=stored,
+                                              first_telemetry={'temperature_c': 75})
+            self.assertEqual((Path(folder) / 'state.json').read_text(), stored)
+        self.assertEqual(calls, [(IDS[0], 2400), (IDS[1], 2500)])
+        self.assertEqual(status['gpu'][IDS[0]]['mode'], 'emergency')
+        self.assertIn('Invalid persistent state', status['errors'][0])
 
     def test_daemon_follows_individual_hive_limits_above_and_below_old_cap(self):
         baselines = dict(zip(IDS, (2900, 3000, 2750, 2850)))

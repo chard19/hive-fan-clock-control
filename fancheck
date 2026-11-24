@@ -17,6 +17,7 @@ CASE_STATUS = Path('/run/cryptone-fan-control/status.json')
 CORE_STATUS = Path('/run/cryptone-core-control/status.json')
 CORE_CONFIG = Path('/etc/cryptone-core-control.toml')
 UUID_RE = re.compile(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z')
+MAX_STATUS_BYTES = 1024 * 1024
 FIELDS = ('min_pwm_percent', 'target_c', 'max_pwm_percent')
 MODES = {
     'normal': 'норма', 'holding': 'удержание', 'waiting_hot': 'ожидание снижения',
@@ -30,21 +31,49 @@ MODES = {
 
 
 def number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def value(item):
     return f'{item:g}' if number(item) else '—'
 
 
+def diagnostic_text(item):
+    return ''.join(character if character.isprintable() else
+                   character.encode('unicode_escape').decode('ascii')
+                   for character in str(item))
+
+
 def read_object(path):
     with Path(path).open('rb') as stream:
-        raw = stream.read(1048577)
-    if len(raw) > 1048576:
+        raw = stream.read(MAX_STATUS_BYTES + 1)
+    if len(raw) > MAX_STATUS_BYTES:
         raise ValueError('файл слишком большой')
+
     def reject_constant(constant):
         raise ValueError(f'нечисловое значение {constant}')
-    data = json.loads(raw, parse_constant=reject_constant)
+
+    def finite_number(token, convert):
+        result = convert(token)
+        if not number(result):
+            raise ValueError('число вне допустимого диапазона JSON-статуса')
+        return result
+
+    def unique_object(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError('повторяющийся ключ в JSON-статусе')
+        return result
+
+    data = json.loads(raw, parse_constant=reject_constant,
+                      parse_float=lambda token: finite_number(token, float),
+                      parse_int=lambda token: finite_number(token, int),
+                      object_pairs_hook=unique_object)
     if not isinstance(data, dict):
         raise ValueError('ожидался JSON-объект')
     return data
@@ -68,14 +97,15 @@ def runtime_status(path, service):
     errors = []
     try:
         data = read_object(path)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         data = {}
         errors.append(f'Статус недоступен: {exc}')
     active = service_status(service)
     stamp = data.get('updated_at')
     age = time.time() - stamp if number(stamp) else None
+    controller_pid = data.get('controller_pid')
     current = (active['state'] == 'active' and active['pid'] > 0 and
-               active['pid'] == data.get('controller_pid') and
+               type(controller_pid) is int and active['pid'] == controller_pid and
                age is not None and 0 <= age <= 20)
     if not current:
         errors.append('Показания устарели, служба не работает или PID не совпадает')
@@ -85,14 +115,24 @@ def runtime_status(path, service):
         errors.append(f"Конфигурация отклонена: {data['config_error']}")
     if data.get('error'):
         errors.append(str(data['error']))
-    if isinstance(data.get('errors'), list):
-        errors.extend(str(e) for e in data['errors'])
+    if 'errors' in data:
+        reported = data['errors']
+        if isinstance(reported, list):
+            valid = [message for message in reported if isinstance(message, str) and message]
+            errors.extend(valid)
+            if len(valid) != len(reported):
+                errors.append('Список ошибок в статусе повреждён')
+        else:
+            errors.append('Список ошибок в статусе повреждён')
     return {'service': active, 'age_seconds': age, 'current': current,
             'status': data, 'warnings': errors}
 
 
 def fan_settings(cfg):
-    if not isinstance(cfg, dict) or any(not number(cfg.get(k)) for k in FIELDS):
+    if not isinstance(cfg, dict) or any(type(cfg.get(k)) is not int for k in FIELDS):
+        return None
+    minimum, target, maximum = (cfg[key] for key in FIELDS)
+    if not (30 <= minimum < maximum <= 100 and 20 <= target <= 70):
         return None
     return {key: cfg[key] for key in FIELDS}
 
@@ -122,6 +162,7 @@ def validate_gpus(core, expected):
         core['warnings'].append('Состав GPU в статусе не совпадает с конфигурацией')
     if not rows:
         core['warnings'].append('Показания видеокарт недоступны или повреждены')
+    indices = {}
     cleaned = {}
     ranges = {'temperature_c': (0, 120), 'fan_percent': (0, 100),
               'actual_core_mhz': (0, 10000), 'baseline_mhz': (500, 10000),
@@ -139,13 +180,20 @@ def validate_gpus(core, expected):
         if type(gpu.get('index')) is not int or gpu['index'] < 0:
             gpu['index'] = None
             problems.append('индекс недоступен')
+        else:
+            indices.setdefault(gpu['index'], []).append(uuid)
+        if 'uuid' in gpu and gpu['uuid'] != uuid:
+            problems.append('UUID не совпадает с ключом GPU')
         mode = gpu.get('mode')
         if not isinstance(mode, str) or mode not in MODES:
             mode = gpu['mode'] = 'sensor_error'
             problems.append('неверный режим')
+        timer_mode = mode in ('waiting_hot', 'waiting_cool', 'emergency_cooling',
+                              'reduced', 'recovering')
         for field, (low, high) in ranges.items():
             item = gpu.get(field)
-            optional = field == 'wait_seconds' or (field == 'baseline_mhz' and mode == 'paused_hive')
+            optional = ((field == 'wait_seconds' and not timer_mode) or
+                        (field == 'baseline_mhz' and mode == 'paused_hive'))
             if not (number(item) and low <= item <= high):
                 gpu[field] = None
                 if item is not None or not optional:
@@ -159,6 +207,11 @@ def validate_gpus(core, expected):
             core['warnings'].append(f"GPU {gpu['index'] if gpu['index'] is not None else uuid[-8:]}: "
                                     + '; '.join(dict.fromkeys(problems)))
         cleaned[uuid] = gpu
+    for index, uuids in indices.items():
+        if len(uuids) > 1:
+            core['warnings'].append(f'Повторяющийся индекс GPU {index}')
+            for uuid in uuids:
+                cleaned[uuid]['index'] = None
     core['status']['gpu'] = cleaned
 
 
@@ -181,7 +234,7 @@ def collect():
                 case['saved_settings'] is not None and
                 case['saved_settings'] == case['applied_settings'] and
                 case['status'].get('config_hash') == control['config_hash'](cfg))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as exc:
             case['warnings'].append(f'Настройки fanset недоступны: {exc}')
         try:
             # Read the channel actually accepted by the running daemon.
@@ -192,25 +245,35 @@ def collect():
             case['pwm'] = read_pwm(control, pwm_cfg)
             if case['pwm']['percent'] is None:
                 case['warnings'].append('PWM управляется BIOS; текущий PWM не подтверждён')
-        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, OverflowError) as exc:
             case['warnings'].append(f'Не удалось прочитать фактический PWM: {exc}')
     if not case['settings_confirmed']:
         case['warnings'].append('Применение сохранённых настроек fanset не подтверждено')
     if case['current']:
         status = case['status']
+        applied = case['applied_settings']
+        pwm = case['pwm']
+        percent = pwm['percent'] if pwm else None
+        limited = status.get('target_unmet_at_limit', False)
         if status.get('mode') not in ('normal', 'emergency'):
             case['warnings'].append('Режим корпусного регулятора недоступен или повреждён')
         if status.get('mode') == 'emergency':
-            case['warnings'].insert(0, 'Аварийное охлаждение 100% независимо от обычного максимума')
-        elif status.get('target_unmet_at_limit'):
+            if percent is None:
+                message = 'Аварийный режим, фактический PWM не подтверждён'
+            elif percent < 99.6:
+                message = 'Аварийный режим, фактический PWM ниже 100%'
+            else:
+                message = 'Аварийное охлаждение 100% независимо от обычного максимума'
+            case['warnings'].insert(0, message)
+        elif limited is True:
             case['warnings'].insert(0, 'Максимум PWM достигнут, целевая температура не удерживается')
+        elif type(limited) is not bool:
+            case['warnings'].append('Признак предельного PWM в статусе повреждён')
         if not number(status.get('hottest_c')) or not 0 <= status['hottest_c'] <= 120:
             status['hottest_c'] = None
             case['warnings'].append('Температура самой горячей GPU недоступна')
-        applied = case['applied_settings']
-        pwm = case['pwm']
-        if (status.get('mode') == 'normal' and applied and pwm and number(pwm['percent']) and
-                not applied['min_pwm_percent'] - 0.4 <= pwm['percent'] <= applied['max_pwm_percent'] + 0.4):
+        if (status.get('mode') == 'normal' and applied and percent is not None and
+                not applied['min_pwm_percent'] - 0.4 <= percent <= applied['max_pwm_percent'] + 0.4):
             case['warnings'].append('Фактический PWM вне применённых границ')
     expected = None
     try:
@@ -225,12 +288,12 @@ def collect():
             raise ValueError('неверный список UUID')
         if cfg and set(expected) != set(cfg['expected_gpu_uuids']):
             core['warnings'].append('Списки GPU корпусного и частотного регуляторов различаются')
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
         expected = None
         core['warnings'].append(f'Конфигурация GPU недоступна: {exc}')
     validate_gpus(core, expected)
     if (core['current'] and gpu_fan_maximum(core['status']) is None and
-            not core['status'].get('errors')):
+            not any('AutoFan' in message for message in core['warnings'])):
         core['warnings'].append('Максимум вентиляторов GPU недоступен')
     for section in (case, core):
         section['warnings'] = list(dict.fromkeys(section['warnings']))
@@ -262,9 +325,10 @@ def render(report):
     print(f'Текущие значение FAN: {percent_text}%, {value(hottest)}°C\n')
     rows = core['status'].get('gpu', {})
     for uuid, gpu in sorted(rows.items(), key=lambda item: (
-            item[1].get('index') if type(item[1].get('index')) is int else 999, item[0])):
+            item[1]['index'] if item[1]['index'] is not None else math.inf, item[0])):
         shown = gpu if core['current'] else {}
-        print(f"GPU {gpu.get('index', '?')} [{uuid[-8:]}]: "
+        index = gpu['index'] if gpu['index'] is not None else '?'
+        print(f"GPU {index} [{uuid[-8:]}]: "
               f"{value(shown.get('temperature_c'))} °C; вентилятор {value(shown.get('fan_percent'))}%")
         print(f"  HiveOS {value(shown.get('baseline_mhz'))}; фиксация {value(shown.get('locked_mhz'))}; "
               f"рабочая {value(shown.get('actual_core_mhz'))} МГц")
@@ -281,7 +345,7 @@ def render(report):
         suffix = f'; осталось {value(wait)} с' if number(wait) else ''
         print(f'  {label}{suffix}')
         if shown.get('pause_reason'):
-            print('  Причина:', shown['pause_reason'])
+            print('  Причина:', diagnostic_text(shown['pause_reason']))
     maximum = gpu_fan_maximum(core['status']) if core['current'] else None
     maximum_text = f'{value(maximum)}%' if maximum is not None else '—'
     print(f'  Максимум вентиляторов GPU: {maximum_text}')
@@ -289,7 +353,7 @@ def render(report):
         messages = list(dict.fromkeys(section['warnings']))
         if messages:
             details = '; подробности: fancheck --json' if len(messages) > 1 else ''
-            print(f'ВНИМАНИЕ [{label}]: {messages[0]}{details}')
+            print(f'ВНИМАНИЕ [{label}]: {diagnostic_text(messages[0])}{details}')
     print_help()
 
 
@@ -299,7 +363,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     report = collect()
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        output = json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2)
+        print(output.encode('utf-8', errors='backslashreplace').decode('utf-8'))
     else:
         render(report)
     return int(any(section['warnings'] for section in report.values()))

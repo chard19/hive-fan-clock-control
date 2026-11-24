@@ -34,6 +34,7 @@ HIVE_BUS = Path('/hive-config/busid.conf')
 HIVE_FANS = Path('/hive-config/autofan.conf')
 CASE_STATUS = Path('/run/cryptone-fan-control/status.json')
 POLL = 5
+MAX_SAMPLE_GAP_SECONDS = POLL * 3
 RESERVE_TEMP_C = 70
 RESERVE_HOLD_SECONDS = 60
 RESERVE_STEP_MHZ = 50
@@ -95,7 +96,10 @@ def bounded_read(path, limit=65536):
 
 def load_config(path=CONFIG):
     raw = bounded_read(path)
-    data = tomllib.loads(raw.decode())
+    try:
+        data = tomllib.loads(raw.decode())
+    except RecursionError as exc:
+        raise ValueError('Core configuration nesting is too deep') from exc
     if set(data) - {'rig', 'defaults', 'gpu'}:
         raise ValueError('Unknown configuration section')
     rig = data.get('rig', {})
@@ -226,6 +230,8 @@ def parse_locks(output):
             locks[index] = None
         m = re.fullmatch(r'\s*GPU CLOCKS LOCKED:\s*(\d+) MHz\s*', line)
         if m and index is not None:
+            if locks[index] is not None:
+                raise ValueError('Duplicate nvtool clock readback')
             locks[index] = int(m[1])
     if not locks:
         raise ValueError('No device lock information from nvtool')
@@ -279,12 +285,16 @@ def hive_baselines(gpus, oc_path=HIVE_OC, detect_path=HIVE_DETECT, bus_path=HIVE
                       not oc.get('OHGODAPILL_START_TIMEOUT') and
                       re.fullmatch(r'-?\d+', extra) else 0)
             lock = core + offset
+        if lock > 5000:
+            raise ValueError(f'Hive lock for {uuid} exceeds the supported 5000 MHz')
         result[uuid] = lock if lock >= 500 else None
     return result
 
 
 def case_cooling(case_path, now):
     case = json.loads(bounded_read(case_path))
+    if not isinstance(case, dict) or type(case.get('updated_at')) not in (int, float):
+        raise ValueError('Invalid case-fan timestamp')
     age = now - case['updated_at']
     if not 0 <= age <= 20:
         raise ValueError('Case-fan status is stale')
@@ -293,6 +303,10 @@ def case_cooling(case_path, now):
     if not (type(maximum) in (int, float) and type(pwm) in (int, float) and
             0 < maximum <= 100 and 0 <= pwm <= 100):
         raise ValueError('Invalid case PWM limits')
+    if 'pwm_mode' in case and (
+            type(case['pwm_mode']) is not int or case['pwm_mode'] not in (0, 1)
+            or (case['pwm_mode'] == 0 and pwm < 98)):
+        raise ValueError('Case PWM is not confirmed in manual or full-speed mode')
     case_error = case.get('error') or case.get('config_error')
     if case_error and not (case.get('mode') == 'emergency' and pwm >= 98):
         raise ValueError('Case-fan error without confirmed emergency PWM')
@@ -314,7 +328,7 @@ def cooling_limits(case_path=CASE_STATUS, fan_path=HIVE_FANS, wall_time=None):
     now = time.time() if wall_time is None else wall_time
     try:
         limits = case_cooling(case_path, now)
-    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
         limits = dict(case_pwm=None, case_max=None, case_at_max=False, case_error=str(exc)[:180])
     try:
         gpu_max = gpu_fan_max(fan_path)
@@ -346,8 +360,13 @@ class GPUState:
         self.reduction_rule = None
 
 
+def valid_lock(value):
+    return type(value) is int and 500 <= value <= 10000
+
+
 def decide(state, settings, baseline, locked, temperature, cooling_at_max, now,
-           allow_growth=True, *, case_at_max=False, case_max=None, gpu_max=None):
+           allow_growth=True, *, case_at_max=False, case_max=None, gpu_max=None,
+           actual_core=None):
     """Return (desired lock or None, mode, wait seconds). No hardware I/O."""
     state.reduction_rule = None
     signature = (baseline, settings)
@@ -364,8 +383,15 @@ def decide(state, settings, baseline, locked, temperature, cooling_at_max, now,
     if baseline is None or baseline < settings.min_core_mhz:
         state.reset_timers()
         return None, 'paused_hive', None
-    if locked is None or locked < 500:
+    if not valid_lock(locked):
         state.reset_timers()
+        if temperature is not None and temperature >= settings.emergency_c:
+            state.emergency = True
+            state.current = min(settings.min_core_mhz, state.current or settings.min_core_mhz)
+        if (state.emergency and state.current is not None and actual_core is not None and
+                actual_core > state.current + CLOCK_TOLERANCE):
+            # The workload clock permits a downward emergency attempt, never a recovery.
+            return state.current, 'emergency', None
         return None, 'sensor_error', None
     ceiling = baseline
     if state.current is None:
@@ -458,20 +484,33 @@ def notify(message):
             sock.sendall(message.encode())
 
 
-def restore_states(cfg, path=STATE):
-    if not Path(path).exists():
-        return {u: GPUState() for u in cfg.uuids}
-    data = json.loads(bounded_read(path))
-    if data.get('version') != 1 or not isinstance(data.get('gpu'), dict):
-        raise ValueError('Invalid persistent core state')
-    states = {}
+def restore_states(cfg, path=STATE, *, errors=None):
+    states = {uuid: GPUState() for uuid in cfg.uuids}
+    try:
+        data = json.loads(bounded_read(path))
+        if (not isinstance(data, dict) or type(data.get('version')) is not int
+                or data['version'] != 1 or not isinstance(data.get('gpu'), dict)):
+            raise ValueError('Invalid persistent core state')
+    except FileNotFoundError:
+        return states
+    except (OSError, ValueError, RecursionError) as exc:
+        if errors is None:
+            raise
+        errors.append(f'Persistent core state unreadable: {str(exc)[:160]}')
+        return states
     for uuid in cfg.uuids:
         item = data['gpu'].get(uuid, {})
-        current, baseline = item.get('current'), item.get('baseline')
-        if any(v is not None and (type(v) is not int or not 500 <= v <= 10000)
-               for v in (current, baseline)) or type(item.get('emergency', False)) is not bool:
-            raise ValueError('Invalid persistent GPU restriction')
-        states[uuid] = GPUState(current, baseline, item.get('emergency', False))
+        if isinstance(item, dict):
+            current, baseline = item.get('current'), item.get('baseline')
+            emergency = item.get('emergency', False)
+            if (all(v is None or valid_lock(v) for v in (current, baseline)) and
+                    type(emergency) is bool):
+                states[uuid] = GPUState(current, baseline, emergency)
+                continue
+        message = f'Invalid persistent state for {uuid}'
+        if errors is None:
+            raise ValueError(message)
+        errors.append(message)
     return states
 
 
@@ -486,9 +525,26 @@ def apply_clock(uuid, desired):
     snapshot = read_gpus()
     locks = read_locks(snapshot)
     actual = locks.get(uuid)
-    if actual is None or abs(actual - desired) > CLOCK_TOLERANCE:
+    if not valid_lock(actual) or abs(actual - desired) > CLOCK_TOLERANCE:
         raise RuntimeError(f'Lock not confirmed: requested={desired}, readback={actual}')
     return actual
+
+
+def verify_recovery(uuid, sampled_gpus, baseline, observed, settings):
+    """Recheck the live HiveOS ceiling and clock before allowing a recovery write."""
+    live_gpus = read_gpus()
+    if (set(live_gpus) != set(sampled_gpus) or
+            live_gpus[uuid]['bus'] != sampled_gpus[uuid]['bus']):
+        raise ValueError('GPU inventory changed before clock recovery')
+    live_lock = read_locks(live_gpus).get(uuid)
+    live_gpu = live_gpus[uuid]
+    if (not valid_lock(live_lock) or live_lock < observed - CLOCK_TOLERANCE or
+            live_gpu['temperature_c'] is None or live_gpu['temperature_c'] > settings.cool_c or
+            live_gpu['fan_percent'] is None):
+        raise ValueError('Clock or thermal conditions changed before clock recovery')
+    if hive_baselines({uuid: live_gpu}).get(uuid) != baseline:
+        raise ValueError('Hive clock profile changed before clock recovery')
+    return live_lock
 
 
 def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
@@ -499,14 +555,23 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    states = restore_states(cfg, state_path)
+    restore_errors = []
+    states = restore_states(cfg, state_path, errors=restore_errors)
+    if restore_errors:
+        LOG.error('Clock recovery disabled until persistent state is repaired and service restarted: %s',
+                  '; '.join(restore_errors))
     saved = persistent_data(states)
     persistence_error = None
     last_modes = {}
+    last_sample = None
     notify('READY=1')
     try:
         while not stop.is_set():
             started = time.monotonic()
+            if last_sample is not None and started - last_sample > MAX_SAMPLE_GAP_SECONDS:
+                for state in states.values():
+                    state.reset_timers()
+            last_sample = started
             config_error = None
             try:
                 candidate = load_config(config_path)
@@ -515,7 +580,7 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                 cfg = candidate
             except (OSError, ValueError, TypeError) as exc:
                 config_error = str(exc)[:220]
-            errors = []
+            errors = restore_errors.copy()
             gpus, locks, baselines, limits = {}, {}, {}, None
             try:
                 gpus = read_gpus()
@@ -548,6 +613,7 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                 settings = cfg.for_gpu(uuid)
                 temp = gpu.get('temperature_c')
                 observed = locks.get(uuid)
+                actual_core = gpu.get('actual_core_mhz')
                 fan = gpu.get('fan_percent')
                 cooling_max = (case_at_max and gpu_threshold is not None and fan is not None and
                                fan >= gpu_threshold)
@@ -558,48 +624,90 @@ def run(cfg, config_path=CONFIG, state_path=STATE, runtime=RUNTIME):
                     # A failed HiveOC read must not prevent a downward emergency action.
                     baseline = observed
                 previous_target = state.current
+                previous_emergency = state.emergency
                 desired, mode, wait = decide(state, settings, baseline, observed,
                                              temp, cooling_max, started,
                                              allow_growth=not errors and not config_error
                                              and fan is not None and not persistence_error,
-                                             case_at_max=case_at_max, case_max=case_max, gpu_max=gpu_max)
-                if (desired is not None and observed is not None and desired < observed and
+                                             case_at_max=case_at_max, case_max=case_max, gpu_max=gpu_max,
+                                             actual_core=actual_core)
+                if (desired is not None and valid_lock(observed) and desired < observed and
                         mode in ('reduced', 'emergency') and desired != previous_target):
                     # Even a last step smaller than the readback tolerance needs a write.
                     state.pending_reduction = desired
                 elif state.pending_reduction != desired or (
-                        desired is not None and observed is not None and observed <= desired):
+                        desired is not None and valid_lock(observed) and observed <= desired):
                     state.pending_reduction = None
                 error = None
-                changed = persistent_data(states)
-                if changed != saved or persistence_error:
+                emergency_without_lock = mode == 'emergency' and not valid_lock(observed)
+                recovery = mode == 'recovering' and desired != previous_target
+                should_write = valid_lock(observed) and desired is not None and (
+                    abs(desired - observed) > CLOCK_TOLERANCE or
+                    state.pending_reduction == desired or (recovery and desired > observed))
+                if should_write and desired > observed:
                     try:
-                        # Record intent first. Disk failure must never block a safe reduction.
+                        observed = verify_recovery(uuid, gpus, baseline, observed, settings)
+                        should_write = (desired > observed or
+                                        observed - desired > CLOCK_TOLERANCE)
+                    except (OSError, ValueError, TypeError, KeyError,
+                            subprocess.SubprocessError, RuntimeError) as exc:
+                        state.current = previous_target if previous_target is not None else observed
+                        state.emergency = previous_emergency
+                        state.reset_timers()
+                        desired, mode, wait = state.current, 'apply_error', None
+                        error = str(exc)[:220]
+                        should_write = False
+                growth_write = should_write and desired > observed
+                prior_target = previous_target if previous_target is not None else observed
+                changed = persistent_data(states)
+                if growth_write:
+                    # A restart during recovery must restore the earlier, lower cap.
+                    changed['gpu'][uuid].update(current=prior_target, emergency=previous_emergency)
+                if not restore_errors and (growth_write or changed != saved or persistence_error):
+                    try:
+                        # Persist before writing the clock, but commit growth only after readback.
                         atomic_json(state_path, changed)
                         saved = changed
                         persistence_error = None
                     except OSError as exc:
                         persistence_error = f'State persistence failed: {str(exc)[:160]}'
                 try:
-                    if (not stop.is_set() and desired is not None and observed is not None
-                            and (abs(desired - observed) > CLOCK_TOLERANCE or
-                                 state.pending_reduction == desired)
-                            and (not persistence_error or desired < observed)):
+                    if not stop.is_set() and (emergency_without_lock or (
+                            should_write and (not persistence_error or desired < observed))):
                         observed = apply_clock(uuid, desired)
                         state.pending_reduction = None
                         LOG.info('%s lock=%sMHz readback=%sMHz mode=%s rule=%s', uuid, desired,
                                  observed, mode, state.reduction_rule)
+                        if growth_write:
+                            try:
+                                changed = persistent_data(states)
+                                atomic_json(state_path, changed)
+                                saved = changed
+                            except OSError as exc:
+                                persistence_error = f'State persistence failed: {str(exc)[:160]}'
+                                state.current, state.emergency = prior_target, previous_emergency
+                                desired = prior_target
+                                if observed > prior_target:
+                                    state.pending_reduction = prior_target
+                                    observed = apply_clock(uuid, prior_target)
+                                    state.pending_reduction = None
                 except (OSError, ValueError, subprocess.SubprocessError, RuntimeError) as exc:
+                    if growth_write:
+                        state.current, state.emergency = prior_target, previous_emergency
+                        desired = state.current
                     error = str(exc)[:220]
                     state.reset_timers()
                     mode = 'apply_error'
                     wait = None
                 if persistence_error:
+                    if growth_write:
+                        state.current, state.emergency = prior_target, previous_emergency
+                        desired = state.current
                     error = error or persistence_error
                     mode = 'storage_error'
                     state.reset_timers()
                     wait = None
-                if temp is None or observed is None or observed < 500:
+                if temp is None or not valid_lock(observed):
                     error = error or 'GPU temperature or locked clock unavailable'
                 row = dict(gpu, uuid=uuid, baseline_mhz=baseline,
                            target_mhz=desired, locked_mhz=observed, mode=mode,

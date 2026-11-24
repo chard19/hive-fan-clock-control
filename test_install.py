@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -43,7 +44,7 @@ class InstallationTests(unittest.TestCase):
              patch.object(install, 'BACKUP_ROOT', self.root), \
              patch.object(install, 'preflight', return_value=(self.cfg, {'pwm_raw': 140, 'pwm_mode': 2})), \
              patch.object(install.subprocess, 'run', side_effect=command), \
-             patch.object(install, 'wait_ready', side_effect=lambda: events.append(['ready'])), \
+             patch.object(install, 'wait_ready', side_effect=lambda *args: events.append(['ready'])), \
              contextlib.redirect_stdout(io.StringIO()):
             install.install(self.build)
         self.assertLess(events.index(['ready']), events.index(['systemctl', 'enable']))
@@ -98,6 +99,64 @@ class InstallationTests(unittest.TestCase):
                 install.install(self.build)
         self.assertFalse((self.root / 'installed').exists())
         run.assert_not_called()
+
+    def test_fresh_status_must_confirm_config_and_every_gpu(self):
+        uuids = set(self.cfg['expected_gpu_uuids'])
+        base = dict(controller_pid=10, updated_at=time.time(), config_hash='hash')
+        fan = dict(base, mode='normal', gpu_temperatures=dict.fromkeys(uuids, 65))
+        core_status = dict(base, gpu={u: {'mode': 'normal'} for u in uuids})
+        self.assertTrue(install.healthy_status(fan, 10, 'hash', uuids, is_core=False))
+        self.assertTrue(install.healthy_status(core_status, 10, 'hash', uuids, is_core=True))
+        self.assertFalse(install.healthy_status(fan, 10, 'wrong', uuids, is_core=False))
+        self.assertFalse(install.healthy_status(fan, 11, 'hash', uuids, is_core=False))
+        self.assertFalse(install.healthy_status([], 10, 'hash', uuids, is_core=False))
+        self.assertFalse(install.healthy_status(dict(core_status, gpu={}), 10, 'hash', uuids, is_core=True))
+        row = next(iter(core_status['gpu'].values()))
+        row['mode'] = 'paused_hive'
+        self.assertFalse(install.healthy_status(core_status, 10, 'hash', uuids, is_core=True))
+
+    def test_verify_failure_removes_only_files_created_by_installer(self):
+        verify_error = subprocess.CalledProcessError(1, ['systemd-analyze', 'verify'])
+        with patch.object(install, 'FILES', self.files), \
+             patch.object(install, 'BACKUP_ROOT', self.root), \
+             patch.object(install, 'preflight', return_value=(self.cfg, {})), \
+             patch.object(install.subprocess, 'run', side_effect=verify_error), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                install.install(self.build)
+        self.assertEqual(list((self.root / 'installed').iterdir()), [])
+        self.assertTrue((self.build / 'cryptone-fan-control.json').exists())
+
+    def test_start_interruption_reports_failed_stop_and_attempts_full_cooling(self):
+        def command(args, **kwargs):
+            if args[:2] == ['systemctl', 'start']:
+                raise KeyboardInterrupt
+            if args[:2] == ['systemctl', 'stop']:
+                raise subprocess.CalledProcessError(1, args)
+            return subprocess.CompletedProcess(args, 0)
+        errors = io.StringIO()
+        with patch.object(install, 'FILES', self.files), \
+             patch.object(install, 'BACKUP_ROOT', self.root), \
+             patch.object(install, 'preflight', return_value=(self.cfg, {})), \
+             patch.object(install.subprocess, 'run', side_effect=command) as run, \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            with self.assertRaises(KeyboardInterrupt):
+                install.install(self.build)
+        self.assertIn('Check service and fan state', errors.getvalue())
+        self.assertTrue(any(c.args[0][-1] == '--failsafe' for c in run.call_args_list))
+
+    def test_config_generation_can_retry_after_incomplete_write(self):
+        output = self.root / 'generated'
+        original_open = Path.open
+        def broken_open(path, *args, **kwargs):
+            if path.parent == output and path.suffix == '.toml':
+                raise OSError('simulated permission failure')
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', broken_open), self.assertRaises(OSError):
+            configure.write_configs(output, self.cfg, '# sample')
+        self.assertFalse(output.exists())
+        configure.write_configs(output, self.cfg, '# sample')
+        self.assertTrue((output / 'cryptone-core-control.toml').exists())
 
 
 if __name__ == '__main__':

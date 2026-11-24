@@ -1,8 +1,10 @@
+import errno
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('control', HERE / 'cryptone-fan-control.py')
@@ -84,6 +86,66 @@ class SafetyTests(unittest.TestCase):
                 path.write_text(json.dumps(cfg))
                 with self.subTest(key=key), self.assertRaises(ValueError):
                     control.load_config(path)
+
+    def test_nonfinite_extension_fields_duplicate_keys_and_overflow_fail_validation(self):
+        raw = json.dumps(self.cfg)
+        cases = [raw[:-1] + ', "extra": [1e9999]}',
+                 raw[:-1] + ', "extra": NaN}',
+                 raw[:-1] + r', "extra": "\ud800"}',
+                 raw[:-1] + ', "target_c": 70}',
+                 json.dumps(dict(self.cfg, rise_interval_seconds=10 ** 400))]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            for encoded in cases:
+                path.write_text(encoded)
+                with self.assertRaises(ValueError):
+                    control.load_config(path)
+
+    def test_driver_requiring_manual_pwm_has_a_full_speed_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node = Path(directory) / 'hwmon4'
+            node.mkdir()
+            (node / 'name').write_text('testchip')
+            (node / 'pwm4').write_text('128')
+            (node / 'pwm4_enable').write_text('2')
+            cfg = dict(self.cfg, controller={'hwmon_name': 'testchip', 'pwm_channel': 4,
+                                            'device_path': '/sys/devices/platform/test'})
+            original = Path.write_text
+            writes = []
+
+            def write(path, value, *args, **kwargs):
+                writes.append((path.name, int(value)))
+                if path.name == 'pwm4' and (node / 'pwm4_enable').read_text().strip() == '2':
+                    raise OSError(errno.EBUSY, 'PWM requires manual mode')
+                return original(path, value, *args, **kwargs)
+
+            with patch.object(control, 'device_identity', return_value=cfg['controller']['device_path']), \
+                    patch.object(Path, 'write_text', new=write):
+                state = control.Fan(cfg, root=Path(directory)).set(40, cfg)
+            self.assertEqual(state['pwm_raw'], 102)
+            self.assertEqual(writes, [('pwm4', 255), ('pwm4_enable', 0), ('pwm4_enable', 1), ('pwm4', 102)])
+
+    def test_existing_controller_never_follows_reused_class_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The class entry is initially a symlink to the first device.
+            for name in ('original', 'replacement'):
+                path = root / name
+                path.mkdir()
+                (path / 'name').write_text('testchip')
+                (path / 'pwm4').write_text('128')
+                (path / 'pwm4_enable').write_text('1')
+            link = root / 'hwmon4'
+            link.symlink_to(root / 'original')
+            cfg = dict(self.cfg, controller={'hwmon_name': 'testchip', 'pwm_channel': 4,
+                                            'device_path': '/sys/devices/platform/test'})
+            with patch.object(control, 'device_identity', return_value=cfg['controller']['device_path']):
+                fan = control.Fan(cfg, root=root)
+                link.unlink()
+                link.symlink_to(root / 'replacement')
+                fan.set(40, cfg)
+            self.assertEqual((root / 'original' / 'pwm4').read_text().strip(), '102')
+            self.assertEqual((root / 'replacement' / 'pwm4').read_text(), '128')
 
 
 if __name__ == '__main__':

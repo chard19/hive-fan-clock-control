@@ -21,9 +21,10 @@ spec.loader.exec_module(control)
 
 
 def make_configs(selector, uuids, target=65, minimum=30, maximum=100, min_core=2400):
+    uuids = list(uuids)
     settings = core.Settings.parse({'min_core_mhz': min_core})
     cfg = control.validate_config(dict(
-        controller=dict(selector), expected_gpu_uuids=list(uuids),
+        controller=dict(selector), expected_gpu_uuids=uuids,
         min_pwm_percent=minimum, max_pwm_percent=maximum, startup_pwm_percent=55,
         target_c=target, critical_c=75, recovery_c=max(70, target + 2),
         deadband_c=1, poll_seconds=5, rise_interval_seconds=10, fall_interval_seconds=20))
@@ -31,10 +32,32 @@ def make_configs(selector, uuids, target=65, minimum=30, maximum=100, min_core=2
             '# Live reload: 5 seconds. UUID changes require stopping both services.\n'
             '# The frequency ceiling comes only from HiveOS; no max_core_mhz.\n\n[defaults]\n')
     text += ''.join(f'{key} = {value}\n' for key, value in asdict(settings).items())
-    text += '\n[rig]\ngpu_uuids = ' + json.dumps(list(uuids)) + '\n'
+    text += '\n[rig]\ngpu_uuids = ' + json.dumps(uuids) + '\n'
     text += ('\n# Per-GPU overrides inherit [defaults], for example:\n'
              f'# [gpu."{uuids[0]}"]\n# min_core_mhz = {min_core}\n')
     return cfg, text
+
+
+def write_configs(output, cfg, toml):
+    output.mkdir(parents=True, exist_ok=False)
+    fan_file = output / 'cryptone-fan-control.json'
+    core_file = output / 'cryptone-core-control.toml'
+    created_core = False
+    try:
+        core.atomic_json(fan_file, cfg)
+        with core_file.open('x', encoding='utf-8') as stream:
+            created_core = True
+            stream.write(toml)
+    except (OSError, KeyboardInterrupt):
+        fan_file.unlink(missing_ok=True)
+        # An unexpected existing entry still belongs to its creator.
+        if created_core:
+            core_file.unlink(missing_ok=True)
+        try:
+            output.rmdir()
+        except OSError:
+            pass
+        raise
 
 
 def main(argv=None):
@@ -66,12 +89,13 @@ def main(argv=None):
         uuids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         cfg, toml = make_configs(selector, uuids, args.target, args.min_pwm, args.max_pwm, args.min_core)
         # Refuse to overwrite previously generated or installed configurations.
-        args.output.mkdir(parents=True, exist_ok=False)
-        core.atomic_json(args.output / 'cryptone-fan-control.json', cfg)
-        (args.output / 'cryptone-core-control.toml').write_text(toml)
+        write_configs(args.output, cfg, toml)
         print(f'Generated {len(uuids)} GPU UUIDs and PWM{args.pwm} in {args.output.resolve()}')
         print('Hardware unchanged. Review both files before installation.')
         return 0
+    except KeyboardInterrupt:
+        print('configure: interrupted', file=sys.stderr)
+        return 130
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f'configure: {exc}', file=sys.stderr)
         return 1

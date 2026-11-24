@@ -237,6 +237,79 @@ class CombinedStatusTests(StatusFixture, unittest.TestCase):
         self.assertIn('Причина: Hive lock disabled',text)
         self.assertIn('целевая температура не удерживается',text)
 
+    def test_thermal_limit_is_a_warning_in_both_output_modes(self):
+        self.case['target_unmet_at_limit'] = True
+        self.write_status()
+        self.assertEqual(self.command()[0], 1)
+        rc, raw = self.command(['--json'])
+        self.assertEqual(rc, 1)
+        self.assertIn('целевая температура не удерживается',
+                      json.loads(raw)['case']['warnings'][0])
+
+    def test_emergency_warns_when_live_pwm_does_not_confirm_full_speed(self):
+        self.case.update(mode='emergency')
+        self.write_status()
+        for mode, message in ((1, 'фактический PWM ниже 100%'),
+                              (2, 'фактический PWM не подтверждён')):
+            with self.subTest(mode=mode):
+                self.hw['pwm_mode'] = mode
+                rc, output = self.command()
+                self.assertEqual(rc, 1)
+                self.assertIn(f'Аварийный режим, {message}', output)
+                self.assertNotIn('Аварийное охлаждение 100%', output)
+
+    def test_corrupt_status_keeps_other_service_and_emits_strict_json(self):
+        for field in ('1e9999', '9' * 400, '[' * 1100 + '0' + ']' * 1100, 'NaN',
+                      '100,"updated_at":101'):
+            with self.subTest(prefix=field[:15]):
+                self.core_path.write_text('{"updated_at":' + field + '}')
+                rc, raw = self.command(['--json'])
+                self.assertEqual(rc, 1)
+                report = json.loads(raw, parse_constant=lambda name: self.fail(name))
+                self.assertFalse(report['core']['current'])
+                self.assertTrue(report['case']['current'])
+                self.assertEqual(report['case']['pwm']['percent'], 58.8)
+
+    def test_malformed_gpu_row_and_duplicate_indices_keep_healthy_gpu_readings(self):
+        self.core['gpu'][self.ids[0]].update(mode=[], wait_seconds=-1)
+        self.core['gpu'][self.ids[1]] = None
+        self.core['gpu'][self.ids[2]]['index'] = 3
+        self.write_status()
+        rc, output = self.command()
+        self.assertEqual(rc, 1)
+        self.assertIn(f"[{self.ids[1][-8:]}]: — °C", output)
+        self.assertIn(f"GPU ? [{self.ids[3][-8:]}]: 62 °C", output)
+        self.assertNotIn('осталось -1 с', output)
+        report = json.loads(self.command(['--json'])[1])
+        self.assertIn('Повторяющийся индекс GPU 3', report['core']['warnings'])
+        self.assertEqual(report['core']['status']['gpu'][self.ids[3]]['temperature_c'], 62)
+
+    def test_fresh_status_with_corrupt_pid_or_wait_does_not_look_healthy(self):
+        self.core['gpu'][self.ids[0]]['wait_seconds'] = None
+        self.case['controller_pid'] = 10.0
+        self.write_status()
+        rc, raw = self.command(['--json'])
+        self.assertEqual(rc, 1)
+        report = json.loads(raw)
+        self.assertFalse(report['case']['current'])
+        self.assertFalse(report['case']['settings_confirmed'])
+        self.assertTrue(report['core']['current'])
+        self.assertIn('wait_seconds недоступно', report['core']['warnings'][0])
+
+    def test_unprintable_diagnostics_do_not_break_text_or_json_output(self):
+        diagnostic = 'driver error\n\x1b\ud800'
+        self.core['errors'] = [diagnostic, None]
+        self.write_status()
+        rc, output = self.command()
+        self.assertEqual(rc, 1)
+        self.assertIn(r'driver error\n\x1b\ud800', output)
+        self.assertNotIn('\x1b', output)
+        rc, output = self.command(['--json'])
+        self.assertEqual(rc, 1)
+        output.encode('utf-8')
+        self.assertEqual(json.loads(output)['core']['warnings'],
+                         [diagnostic, 'Список ошибок в статусе повреждён'])
+
     def test_exact_requested_normal_template(self):
         self.hw['pwm_raw']=79
         self.case['hottest_c']=67
